@@ -1,11 +1,8 @@
-# streamlit_app.py  (v7.2)
-# - Filters: "Select all / Clear" buttons for Plate, Amplicon, Dose (session_state-backed)
-# - Indel% primary chart; optional %OOF chart (same order/colors)
-# - PNG export via camera icon: width 1200 (<=2400), scale 1–3 (default 2), lockable 16:9 ratio
-# - Remove x-axis title
-# - QC filters (Reads_in_input, alignment%) applied globally after loading
-# - GraphPad tables: correct group parsing (no truncation), "Description" = Description minus dose only,
-#   append %OOF blocks, uniform replicate counts, fixed ordering
+# streamlit_app.py  (v7.3)
+# - Filters: Select all/Clear with hierarchy clears (Plate > Amplicon > Dose)
+# - In vivo mode: parse Description like '...-A1-0.2mpk' -> group='...-A', rep=1, dose='0.2mpk'
+# - Indel% main chart; optional %OOF chart (same order/colors)
+# - QC trimming; GraphPad tables incl. %OOF; Excel export; hi-res camera export
 
 import io
 import re
@@ -18,9 +15,9 @@ st.set_page_config(page_title="CRISPR Indel/%OOF Explorer", layout="wide")
 st.title("CRISPR Indel / %OOF Explorer")
 
 st.caption(
-    "Replicates are grouped by identical **Description**. "
+    "Replicates are grouped by identical **Description** (or animal pattern in *in vivo* mode). "
     "**Sample_ID** → Plate/Well (e.g., `py3B1` → plate `py3`, well `B1`). "
-    "**Description** → Group (prefix before the last '-') and Dose (suffix)."
+    "**Description** → Group and Dose (suffix). In *in vivo* mode, animal replicates are decoded from the token just before the last `-` (e.g., `...-A1-0.2mpk`)."
 )
 
 # ---------------- Sample dataset (for demo only) ----------------
@@ -39,7 +36,7 @@ def load_sample() -> pd.DataFrame:
 with st.sidebar:
     st.header("1) Load data")
     uploaded = st.file_uploader("Upload CSV", type=["csv"])
-    use_sample = st.checkbox("Use sample dataset", value=not uploaded)
+    use_sample = st.checkbox("Use example dataset", value=not uploaded)
 
     st.markdown("**Trim low-quality rows (optional)**")
     apply_qc = st.checkbox("Enable QC trimming", value=True)
@@ -88,22 +85,42 @@ def parse_plate_well(sample_id: str):
     well = well[0] + str(int(well[1:]))  # normalize B01->B1
     return plate, well
 
-def parse_group_and_dose(description: str):
+# -------- In vivo toggle (before parsing) --------
+with st.sidebar:
+    st.header("Study type")
+    in_vivo_mode = st.checkbox(
+        "This is *in vivo* data (animal replicates encoded in Description like `...-A1-0.2mpk`)",
+        value=False,
+        help="When enabled, the token right before the last '-' is parsed as Group+Replicate (e.g., A1,B2). Group becomes '...-A', replicate becomes 1."
+    )
+
+def parse_group_and_dose(description: str, in_vivo: bool):
+    # returns: group_label, dose_str, dose_val, rep_num
     if description is None or (isinstance(description, float) and np.isnan(description)):
-        return "Unknown", "NA", np.nan
+        return "Unknown", "NA", np.nan, np.nan
     s = str(description).strip()
     if "-" not in s:
-        return s, "NA", np.nan
-    group, dose = s.rsplit("-", 1)
+        return s, "NA", np.nan, np.nan
+    prefix, dose = s.rsplit("-", 1)
     dose_val = numeric_from_string(dose)
-    return group, dose, dose_val
+    rep_num = np.nan
+    if in_vivo:
+        # match trailing Letter+Digits at end of prefix
+        m = re.search(r"([A-Za-z])(\d+)$", prefix)
+        if m:
+            # group label = prefix with the trailing digits removed (keep letter)
+            group_label = re.sub(r"([A-Za-z])(\d+)$", r"\1", prefix)
+            rep_num = float(m.group(2))
+            return group_label, dose, dose_val, rep_num
+    # default: group is everything before last '-'
+    return prefix, dose, dose_val, np.nan
 
 # ---------- Load raw ----------
 if uploaded:
     raw = read_csv(uploaded)
 elif use_sample:
     raw = load_sample()
-    st.info("Using a built-in sample dataset. Uncheck to upload your CSV.")
+    st.info("Using a built-in example dataset. Uncheck to upload your CSV.")
 else:
     st.stop()
 
@@ -133,14 +150,23 @@ if raa_col: df[raa_col] = df[raa_col].apply(numeric_from_string)
 
 plates, wells = zip(*df[sid_col].map(parse_plate_well))
 df["_Plate"] = list(plates); df["_Well"] = list(wells)
-grp, dose, dose_val = zip(*df[desc_col].map(parse_group_and_dose))
-df["_Group"]   = list(grp); df["_Dose"] = list(dose); df["_DoseVal"] = list(dose_val)
+group_label, dose, dose_val, repnum = zip(*df[desc_col].map(lambda s: parse_group_and_dose(s, in_vivo_mode)))
+df["_Group"]   = list(group_label)
+df["_Dose"]    = list(dose)
+df["_DoseVal"] = list(dose_val)
+df["_RepNum"]  = list(repnum)  # NaN for non-in-vivo or unmatched rows
+# Normalize missing/blank doses → "0", and recompute numeric value
+df["_Dose"] = df["_Dose"].astype(str).replace({None: "0", "nan": "0", "NA": "0", "None": "0", "": "0"})
+df["_DoseVal"] = df["_Dose"].apply(numeric_from_string)
 
 # ---------- Compute alignment% and apply QC trimming ----------
 if rin_col and raa_col:
     df["alignment%"] = np.where(df[rin_col] > 0, (df[raa_col] / df[rin_col]) * 100.0, np.nan)
 else:
     df["alignment%"] = np.nan
+
+with st.sidebar:
+    st.markdown("---")
 
 if apply_qc:
     mask_qc = pd.Series(True, index=df.index)
@@ -149,7 +175,10 @@ if apply_qc:
     if rin_col and raa_col:
         mask_qc &= df["alignment%"].ge(qc_align_min)
     df = df[mask_qc].copy()
-    st.success(f"QC trimming kept {len(df)}/{len(raw)} rows.")
+    kept = len(df)
+    total = len(raw)
+    removed = total - kept
+    st.success(f"QC trimming kept {kept}/{total} rows ({removed} removed).")
 
 # ---------- QC plots ----------
 st.subheader("QC: Sequencing depth & alignment")
@@ -184,73 +213,133 @@ else:
 st.markdown("---")
 
 # ---------------- Sidebar: Filters & options ----------------
+def _on_plates_change():
+    # user changed Plate(s) manually → reset downstream
+    st.session_state.selected_amplicons = []
+    st.session_state.selected_doses = []
+
+def _on_amplicons_change():
+    # user changed Amplicon(s) manually → reset downstream
+    st.session_state.selected_doses = []
+
 with st.sidebar:
     st.header("2) Filters (to show)")
 
-    # init session state for multiselects
+    # keep state keys stable
     for k in ("selected_plates", "selected_amplicons", "selected_doses"):
         st.session_state.setdefault(k, [])
 
-    # ----- Plates -----
+    # ---------- PLATE(S) ----------
     available_plates = sorted(pd.Series(df["_Plate"].astype(str)).unique().tolist())
+
     st.write("**Plate(s)**")
     c1, c2 = st.columns(2)
     with c1:
-        st.button("Select all", key="plates_all",
-                  on_click=lambda: st.session_state.update(selected_plates=available_plates))
+        st.button(
+            "Select all",
+            key="plates_all",
+            on_click=lambda: st.session_state.update(
+                selected_plates=available_plates,
+                selected_amplicons=[],
+                selected_doses=[],
+            ),
+        )
     with c2:
-        st.button("Clear", key="plates_clear",
-                  on_click=lambda: st.session_state.update(selected_plates=[]))
+        st.button(
+            "Clear",
+            key="plates_clear",
+            on_click=lambda: st.session_state.update(
+                selected_plates=[],
+                selected_amplicons=[],
+                selected_doses=[],
+            ),
+        )
+
     selected_plates = st.multiselect(
-        "", options=available_plates,
-        default=st.session_state["selected_plates"], key="selected_plates",
-        label_visibility="collapsed"
+        "",
+        options=available_plates,
+        default=st.session_state["selected_plates"],
+        key="selected_plates",
+        label_visibility="collapsed",
+        on_change=_on_plates_change,   # clears downstream when user edits manually
     )
 
-    # ----- Amplicons -----
+    # ---------- AMPLICON ----------
     if amp_col:
         amp_pool = (
             df[df["_Plate"].astype(str).isin(selected_plates)][amp_col].astype(str)
             if selected_plates else df[amp_col].astype(str)
         )
-        available_amplicons = sorted([a for a in amp_pool.dropna().unique().tolist() if a != ""])
+        available_amplicons = sorted(
+            [a for a in amp_pool.dropna().unique().tolist() if a != ""]
+        )
     else:
         available_amplicons = []
+
     st.write("**Amplicon**")
     c1, c2 = st.columns(2)
     with c1:
-        st.button("Select all", key="amp_all",
-                  on_click=lambda: st.session_state.update(selected_amplicons=available_amplicons))
+        st.button(
+            "Select all",
+            key="amp_all",
+            on_click=lambda: st.session_state.update(
+                selected_amplicons=available_amplicons,
+                selected_doses=[],
+            ),
+        )
     with c2:
-        st.button("Clear", key="amp_clear",
-                  on_click=lambda: st.session_state.update(selected_amplicons=[]))
+        st.button(
+            "Clear",
+            key="amp_clear",
+            on_click=lambda: st.session_state.update(
+                selected_amplicons=[],
+                selected_doses=[],
+            ),
+        )
+
     selected_amplicons = st.multiselect(
-        "", options=available_amplicons,
-        default=st.session_state["selected_amplicons"], key="selected_amplicons",
-        label_visibility="collapsed"
+        "",
+        options=available_amplicons,
+        default=st.session_state["selected_amplicons"],
+        key="selected_amplicons",
+        label_visibility="collapsed",
+        on_change=_on_amplicons_change,  # clears doses when user edits manually
     )
 
-    # ----- Doses -----
+    # ---------- DOSE(S) ----------
     if selected_plates:
         dose_pool = df[df["_Plate"].astype(str).isin(selected_plates)].copy()
         if amp_col and selected_amplicons:
             dose_pool = dose_pool[dose_pool[amp_col].astype(str).isin(selected_amplicons)]
-        available_doses = [d for d in sorted(dose_pool["_Dose"].astype(str).unique()) if d != "NA"]
+        available_doses = [
+            d for d in sorted(dose_pool["_Dose"].astype(str).unique()) if d != "NA"
+        ]
     else:
         available_doses = []
+
     st.write("**Dose(s)**")
     c1, c2 = st.columns(2)
     with c1:
-        st.button("Select all", key="dose_all",
-                  on_click=lambda: st.session_state.update(selected_doses=available_doses))
+        st.button(
+            "Select all",
+            key="dose_all",
+            on_click=lambda: st.session_state.update(selected_doses=available_doses),
+        )
     with c2:
-        st.button("Clear", key="dose_clear",
-                  on_click=lambda: st.session_state.update(selected_doses=[]))
+        st.button(
+            "Clear",
+            key="dose_clear",
+            on_click=lambda: st.session_state.update(selected_doses=[]),
+        )
+
     selected_doses = st.multiselect(
-        "", options=available_doses,
-        default=st.session_state["selected_doses"], key="selected_doses",
-        label_visibility="collapsed"
+        "",
+        options=available_doses,
+        default=st.session_state["selected_doses"],
+        key="selected_doses",
+        label_visibility="collapsed",
     )
+
 
     st.header("3) Plot options")
     group_by_series = st.checkbox("Group by dose series (keep doses of same group together)", value=True)
@@ -292,12 +381,19 @@ if amp_col and selected_amplicons:
     mask &= df[amp_col].astype(str).isin(selected_amplicons)
 fdf = df[mask].copy()
 
+# warn if in vivo mode but no rows match animal pattern
+if in_vivo_mode and not fdf["_RepNum"].notna().any():
+    st.warning("**In vivo mode is enabled, but none of the selected rows match the animal pattern** "
+               "(letter+number right before the last '-'). Showing standard grouping instead.")
+
 # ---------------- Aggregate for Indel% ----------------
 agg_indel = (
-    fdf.groupby([desc_col, "_Group", "_Dose", "_DoseVal"], dropna=False)[indel_col]
+    fdf.groupby([ "_Group", "_Dose", "_DoseVal"], dropna=False)[indel_col]
        .agg(mean="mean", std="std", count="count")
        .reset_index()
 )
+# reconstruct label for x-axis
+agg_indel["_DescLabel"] = agg_indel["_Group"].astype(str) + "-" + agg_indel["_Dose"].astype(str)
 
 # Dose ordering
 dose_low_to_high = (
@@ -330,13 +426,11 @@ if group_by_series:
         present = [d for d in dose_order if d in set(agg_indel.loc[agg_indel["_Group"] == g, "_Dose"].astype(str))]
         x_categories.extend([f"{g}-{d}" for d in present])
 else:
-    agg_indel["_DescLabel"] = agg_indel["_Group"].astype(str) + "-" + agg_indel["_Dose"].astype(str)
     asc = (ungrouped_order == "By mean ↑")
     order_by_mean = agg_indel.sort_values(by=["mean", "_Group", "_DoseVal"], ascending=[asc, True, False])["_DescLabel"].tolist()
     x_categories = list(dict.fromkeys(order_by_mean))
 
 # Apply categorical order
-agg_indel["_DescLabel"] = agg_indel["_Group"].astype(str) + "-" + agg_indel["_Dose"].astype(str)
 agg_indel["_DescLabel"] = pd.Categorical(agg_indel["_DescLabel"], categories=x_categories, ordered=True)
 
 # ---------------- Colors: darkest = highest dose ----------------
@@ -372,15 +466,13 @@ fig = px.bar(
     agg_indel.sort_values("_DescLabel"),
     x="_DescLabel", y="mean", error_y="std",
     color="_DescLabel", color_discrete_map=color_discrete_map,
-    hover_data={desc_col: True, "_Group": True, "_Dose": True, "_DoseVal": True, "mean":":.2f", "std":":.2f", "count":True},
+    hover_data={"_Group": True, "_Dose": True, "_DoseVal": True, "mean":":.2f", "std":":.2f", "count":True},
 )
 fig.update_layout(margin=dict(l=10, r=10, t=30, b=10),
                   xaxis_title=None, yaxis_title="Mean Indel% (± SD)", showlegend=False)
 config = {
-    "toImageButtonOptions": {
-        "format": "png", "filename": "indel_bars",
-        "width": int(png_w), "height": int(png_h), "scale": int(png_scale),
-    },
+    "toImageButtonOptions": {"format": "png", "filename": "indel_bars",
+                             "width": int(png_w), "height": int(png_h), "scale": int(png_scale)},
     "displaylogo": False,
 }
 st.plotly_chart(fig, use_container_width=True, config=config)
@@ -388,7 +480,7 @@ st.plotly_chart(fig, use_container_width=True, config=config)
 # ---------------- Optional %OOF plot (same order/colors) ----------------
 if show_oof and oof_col and oof_col in fdf.columns:
     agg_oof = (
-        fdf.groupby([desc_col, "_Group", "_Dose", "_DoseVal"], dropna=False)[oof_col]
+        fdf.groupby(["_Group", "_Dose", "_DoseVal"], dropna=False)[oof_col]
            .agg(mean="mean", std="std", count="count")
            .reset_index()
     )
@@ -398,15 +490,13 @@ if show_oof and oof_col and oof_col in fdf.columns:
         agg_oof.sort_values("_DescLabel"),
         x="_DescLabel", y="mean", error_y="std",
         color="_DescLabel", color_discrete_map=color_discrete_map,
-        hover_data={desc_col: True, "_Group": True, "_Dose": True, "_DoseVal": True, "mean":":.2f", "std":":.2f", "count":True},
+        hover_data={"_Group": True, "_Dose": True, "_DoseVal": True, "mean":":.2f", "std":":.2f", "count":True},
     )
     fig2.update_layout(margin=dict(l=10, r=10, t=30, b=10),
                        xaxis_title=None, yaxis_title="Mean %OOF (± SD)", showlegend=False)
     config2 = {
-        "toImageButtonOptions": {
-            "format": "png", "filename": "oof_bars",
-            "width": int(png_w), "height": int(png_h), "scale": int(png_scale),
-        },
+        "toImageButtonOptions": {"format": "png", "filename": "oof_bars",
+                                 "width": int(png_w), "height": int(png_h), "scale": int(png_scale)},
         "displaylogo": False,
     }
     st.plotly_chart(fig2, use_container_width=True, config=config2)
@@ -420,12 +510,11 @@ col_map = {"Sample_ID": sid_col, "Description": desc_col, "Indel%": indel_col, "
            "Reads_in_input": rin_col, "Reads_aligned_all_amplicons": raa_col, "alignment%": "alignment%"}
 rows_df = pd.DataFrame({k: (np.nan if col_map[k] is None else fdf[col_map[k]]) for k in ordered_cols})
 
-# For GraphPad tables, use DESCRIPTION TRIMMED OF DOSE ONLY
-desc_to_group = dict(zip(agg_indel["_DescLabel"].astype(str), agg_indel["_Group"].astype(str)))
+# Build order for GraphPad tables from plotted categories
 groups_in_order = []
 for lbl in x_categories:
-    g = desc_to_group.get(lbl)
-    if g is not None and g not in groups_in_order:
+    g = str(lbl).rsplit("-", 1)[0]
+    if g not in groups_in_order:
         groups_in_order.append(g)
 doses_high_to_low = list(reversed(dose_low_to_high))  # columns in high->low order
 
@@ -433,19 +522,23 @@ def fmt1(x):
     try: return f"{float(x):.1f}"
     except Exception: return str(x)
 
-# sort wells nice; replicate idx per (_Group, _Dose)
+# Sort within (group, dose) by explicit animal replicate if available, else by well/sample order
 def well_sort_key(w):
     s = str(w); m = re.match(r"^([A-Ha-h])\s*[-:]?\s*(\d{1,2})$", s)
     if m: return (ord(m.group(1).upper()) - ord('A'), int(m.group(2)))
     return (99, 99, s)
 
-if "_Well" in fdf.columns and fdf["_Well"].notna().any():
-    fdf_sorted = fdf.sort_values(by=["_Group", "_Dose", "_Well"], key=lambda s: s.map(well_sort_key) if s.name == "_Well" else s)
+if fdf["_RepNum"].notna().any():
+    fdf_sorted = fdf.sort_values(by=["_Group", "_Dose", "_RepNum", sid_col])
 else:
-    fdf_sorted = fdf.sort_values(by=["_Group", "_Dose", sid_col])
+    if "_Well" in fdf.columns and fdf["_Well"].notna().any():
+        fdf_sorted = fdf.sort_values(by=["_Group", "_Dose", "_Well"], key=lambda s: s.map(well_sort_key) if s.name == "_Well" else s)
+    else:
+        fdf_sorted = fdf.sort_values(by=["_Group", "_Dose", sid_col])
+
 fdf_sorted["_rep_idx"] = fdf_sorted.groupby(["_Group", "_Dose"]).cumcount() + 1
 
-# ---------- GraphPad Type 1 (rows = Group/Description, cols = Doses with uniform replicates) ----------
+# ---------- GraphPad Type 1 (rows = Group, cols = Doses; uniform replicates) ----------
 def make_type1(metric_label, metric_src_col):
     max_reps_global = 1
     for d in doses_high_to_low:
@@ -459,8 +552,8 @@ def make_type1(metric_label, metric_src_col):
         row = {"Description": g}
         subg = fdf_sorted[fdf_sorted["_Group"] == g]
         for d in doses_high_to_low:
-            subgd = subg[subg["_Dose"].astype(str) == d].sort_values("_rep_idx")
-            vals = [fmt1(v) for v in subgd[metric_src_col].tolist()]
+            subgd = subg[subg["_Dose"].astype(str) == d]
+            vals = [fmt1(v) for v in subgd.sort_values(["_RepNum","_rep_idx"]) [metric_src_col].tolist()]
             for i in range(1, max_reps_global+1):
                 row[f"{d}_{metric_label}_rep{i}"] = (vals[i-1] if i-1 < len(vals) else np.nan)
         rows.append(row)
@@ -472,7 +565,7 @@ if oof_col and oof_col in fdf_sorted.columns:
     type1_oof = make_type1("%OOF", oof_col)
     type1_df = type1_indel.merge(type1_oof.drop(columns=["Description"]), left_index=True, right_index=True)
 
-# ---------- GraphPad Type 2 (rows = Dose, cols = Groups with uniform replicates) ----------
+# ---------- GraphPad Type 2 (rows = Dose, cols = Groups; uniform replicates) ----------
 def make_type2(metric_label, metric_src_col):
     max_reps_global = 1
     for g in groups_in_order:
@@ -486,8 +579,8 @@ def make_type2(metric_label, metric_src_col):
         row = {"Dose": d}
         subd = fdf_sorted[fdf_sorted["_Dose"].astype(str) == d]
         for g in groups_in_order:
-            subdg = subd[subd["_Group"] == g].sort_values("_rep_idx")
-            vals = [fmt1(v) for v in subdg[metric_src_col].tolist()]
+            subdg = subd[subd["_Group"] == g]
+            vals = [fmt1(v) for v in subdg.sort_values(["_RepNum","_rep_idx"]) [metric_src_col].tolist()]
             for i in range(1, max_reps_global+1):
                 row[f"{g}_{metric_label}_rep{i}"] = (vals[i-1] if i-1 < len(vals) else np.nan)
         rows.append(row)
