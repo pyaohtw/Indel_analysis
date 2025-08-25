@@ -89,31 +89,49 @@ def parse_plate_well(sample_id: str):
 with st.sidebar:
     st.header("Study type")
     in_vivo_mode = st.checkbox(
-        "This is *in vivo* data (animal replicates encoded in Description like `...-A1-0.2mpk`)",
+        "Analyze as **in vivo** data (names like `A1-…-0.2mpk`)",
         value=False,
-        help="When enabled, the token right before the last '-' is parsed as Group+Replicate (e.g., A1,B2). Group becomes '...-A', replicate becomes 1."
+        help=(
+            "When on: parse the FIRST letter+number at the beginning (A1, B2, …) "
+            "as Group=letter and Replicate=number. Dose comes from the last '-' token "
+            "(blank doses become 0). Rows that don’t match this pattern are removed "
+            "from filters, plots, and exports."
+        ),
     )
 
 def parse_group_and_dose(description: str, in_vivo: bool):
-    # returns: group_label, dose_str, dose_val, rep_num
+    """
+    Returns: (group_label, dose_str, dose_val, rep_num, in_vivo_match)
+
+    In vitro: group = text before last '-'; dose = text after last '-' (or '0' if absent); rep_num = NaN
+    In vivo:  group = FIRST letter at start, replicate = digits immediately after it (e.g., A1, B2),
+              dose = text after last '-' (or '0' if absent). Rows not matching A<digits> at start are flagged False.
+    """
     if description is None or (isinstance(description, float) and np.isnan(description)):
-        return "Unknown", "NA", np.nan, np.nan
+        return "Unknown", "0", 0.0, np.nan, False
+
     s = str(description).strip()
-    if "-" not in s:
-        return s, "NA", np.nan, np.nan
-    prefix, dose = s.rsplit("-", 1)
+
+    # dose: last token after '-' (fallback to "0")
+    if "-" in s:
+        prefix, dose = s.rsplit("-", 1)
+    else:
+        prefix, dose = s, "0"
     dose_val = numeric_from_string(dose)
-    rep_num = np.nan
+
     if in_vivo:
-        # match trailing Letter+Digits at end of prefix
-        m = re.search(r"([A-Za-z])(\d+)$", prefix)
+        # FIRST token: letter+number at the BEGINNING, e.g., A1, B2, Z10
+        m = re.match(r"^\s*([A-Za-z])(\d+)\b", s)
         if m:
-            # group label = prefix with the trailing digits removed (keep letter)
-            group_label = re.sub(r"([A-Za-z])(\d+)$", r"\1", prefix)
-            rep_num = float(m.group(2))
-            return group_label, dose, dose_val, rep_num
-    # default: group is everything before last '-'
-    return prefix, dose, dose_val, np.nan
+            group_label = m.group(1)           # just the letter (A, B, C…)
+            rep_num = float(m.group(2))        # 1,2,3,...
+            return group_label, dose, dose_val, rep_num, True
+        else:
+            # mark as non-match; caller will drop these rows in in-vivo mode
+            return "NON-MATCH", dose, dose_val, np.nan, False
+
+    # default: in vitro rule (group = prefix before last '-')
+    return prefix, dose, dose_val, np.nan, True
 
 # ---------- Load raw ----------
 if uploaded:
@@ -150,14 +168,23 @@ if raa_col: df[raa_col] = df[raa_col].apply(numeric_from_string)
 
 plates, wells = zip(*df[sid_col].map(parse_plate_well))
 df["_Plate"] = list(plates); df["_Well"] = list(wells)
-group_label, dose, dose_val, repnum = zip(*df[desc_col].map(lambda s: parse_group_and_dose(s, in_vivo_mode)))
+group_label, dose, dose_val, repnum, match = zip(*df[desc_col].map(lambda s: parse_group_and_dose(s, in_vivo_mode)))
 df["_Group"]   = list(group_label)
 df["_Dose"]    = list(dose)
 df["_DoseVal"] = list(dose_val)
-df["_RepNum"]  = list(repnum)  # NaN for non-in-vivo or unmatched rows
+df["_RepNum"]  = list(repnum)       # NaN for non-in-vivo or unmatched
+df["_InVivoMatch"] = list(match)
+
 # Normalize missing/blank doses → "0", and recompute numeric value
 df["_Dose"] = df["_Dose"].astype(str).replace({None: "0", "nan": "0", "NA": "0", "None": "0", "": "0"})
 df["_DoseVal"] = df["_Dose"].apply(numeric_from_string)
+
+# STRICT: when in-vivo is ON, DROP non-matching rows up front (shrinks Plates/Doses to only relevant)
+if in_vivo_mode:
+    df = df[df["_InVivoMatch"]].copy()
+    if df.empty:
+        st.warning("In vivo mode is enabled, but none of the rows match the pattern like `A1-…-0.2mpk`. Turn off in vivo mode or check the data.")
+        st.stop()
 
 # ---------- Compute alignment% and apply QC trimming ----------
 if rin_col and raa_col:
@@ -256,12 +283,13 @@ with st.sidebar:
         )
 
     selected_plates = st.multiselect(
-        "",
+        "Plate(s)",                           # <-- non-empty label
         options=available_plates,
         default=st.session_state["selected_plates"],
         key="selected_plates",
-        label_visibility="collapsed",
-        on_change=_on_plates_change,   # clears downstream when user edits manually
+        label_visibility="collapsed",         # hidden visually, but satisfies accessibility
+        on_change=_on_plates_change,
+        help="Choose one or more plates",
     )
 
     # ---------- AMPLICON ----------
@@ -298,12 +326,13 @@ with st.sidebar:
         )
 
     selected_amplicons = st.multiselect(
-        "",
+        "Amplicon",
         options=available_amplicons,
         default=st.session_state["selected_amplicons"],
         key="selected_amplicons",
         label_visibility="collapsed",
-        on_change=_on_amplicons_change,  # clears doses when user edits manually
+        on_change=_on_amplicons_change,
+        help="Filter to specific amplicons",
     )
 
     # ---------- DOSE(S) ----------
@@ -331,15 +360,14 @@ with st.sidebar:
             key="dose_clear",
             on_click=lambda: st.session_state.update(selected_doses=[]),
         )
-
     selected_doses = st.multiselect(
-        "",
+        "Dose(s)",
         options=available_doses,
         default=st.session_state["selected_doses"],
         key="selected_doses",
         label_visibility="collapsed",
+        help="Pick which doses to plot",
     )
-
 
     st.header("3) Plot options")
     group_by_series = st.checkbox("Group by dose series (keep doses of same group together)", value=True)
