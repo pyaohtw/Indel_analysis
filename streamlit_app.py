@@ -1,6 +1,6 @@
 # streamlit_app.py  (v7.3)
 # - Filters: Select all/Clear with hierarchy clears (Plate > Amplicon > Dose)
-# - In vivo mode: parse Description like '...-A1-0.2mpk' -> group='...-A', rep=1, dose='0.2mpk'
+# - In vivo mode: parse Description like 'A1-...-0.2mpk' -> group='A-...', rep=1, dose='0.2mpk'
 # - Indel% main chart; optional %OOF chart (same order/colors)
 # - QC trimming; GraphPad tables incl. %OOF; Excel export; hi-res camera export
 
@@ -15,9 +15,11 @@ st.set_page_config(page_title="CRISPR Indel/%OOF Explorer", layout="wide")
 st.title("CRISPR Indel / %OOF Explorer")
 
 st.caption(
-    "Replicates are grouped by identical **Description** (or animal pattern in *in vivo* mode). "
+    "Replicates are grouped by identical **Description** (or by animal pattern in **in vivo** mode). "
     "**Sample_ID** → Plate/Well (e.g., `py3B1` → plate `py3`, well `B1`). "
-    "**Description** → Group and Dose (suffix). In *in vivo* mode, animal replicates are decoded from the token just before the last `-` (e.g., `...-A1-0.2mpk`)."
+    "**In vitro**: **Description** ⇒ group = text before the last `-`, dose = token after the last `-` (blank → `0`). "
+    "**In vivo**: parse the **first** letter+number at the beginning (e.g., `A1-…-0.2mpk`) as Group=`A`, Replicate=`1`; "
+    "dose still comes from the last `-`. Rows not matching this pattern are removed from filters, plots, and exports."
 )
 
 # ---------------- Sample dataset (for demo only) ----------------
@@ -282,15 +284,23 @@ with st.sidebar:
             ),
         )
 
-    selected_plates = st.multiselect(
-        "Plate(s)",                           # <-- non-empty label
-        options=available_plates,
-        default=st.session_state["selected_plates"],
-        key="selected_plates",
-        label_visibility="collapsed",         # hidden visually, but satisfies accessibility
-        on_change=_on_plates_change,
-        help="Choose one or more plates",
-    )
+    with st.expander("Choose plate(s)", expanded=False):
+        q_pl = st.text_input(
+            "Search plates", key="plate_search",
+            label_visibility="collapsed", placeholder="Search plates"
+        )
+        plate_opts = [o for o in available_plates if not q_pl or q_pl.lower() in o.lower()]
+        for o in plate_opts:
+            st.checkbox(o, key=f"plate_opt_{o}", value=(o in st.session_state.selected_plates))
+        if st.button("Apply plates", key="apply_plates"):
+            st.session_state.selected_plates = [
+                o for o in available_plates if st.session_state.get(f"plate_opt_{o}", False)
+            ]
+            _on_plates_change()  # clears downstream
+
+    # current plate selection (read-only summary)
+    selected_plates = st.session_state["selected_plates"]
+    st.caption("Selected plates: " + (", ".join(selected_plates) if selected_plates else "none"))
 
     # ---------- AMPLICON ----------
     if amp_col:
@@ -298,9 +308,7 @@ with st.sidebar:
             df[df["_Plate"].astype(str).isin(selected_plates)][amp_col].astype(str)
             if selected_plates else df[amp_col].astype(str)
         )
-        available_amplicons = sorted(
-            [a for a in amp_pool.dropna().unique().tolist() if a != ""]
-        )
+        available_amplicons = sorted([a for a in amp_pool.dropna().unique().tolist() if a != ""])
     else:
         available_amplicons = []
 
@@ -325,24 +333,29 @@ with st.sidebar:
             ),
         )
 
-    selected_amplicons = st.multiselect(
-        "Amplicon",
-        options=available_amplicons,
-        default=st.session_state["selected_amplicons"],
-        key="selected_amplicons",
-        label_visibility="collapsed",
-        on_change=_on_amplicons_change,
-        help="Filter to specific amplicons",
-    )
+    with st.expander("Choose amplicon(s)", expanded=False):
+        q_amp = st.text_input(
+            "Search amplicons", key="amp_search",
+            label_visibility="collapsed", placeholder="Search amplicons"
+        )
+        amp_opts = [o for o in available_amplicons if not q_amp or q_amp.lower() in o.lower()]
+        for o in amp_opts:
+            st.checkbox(o, key=f"amp_opt_{o}", value=(o in st.session_state.selected_amplicons))
+        if st.button("Apply amplicons", key="apply_amplicons"):
+            st.session_state.selected_amplicons = [
+                o for o in available_amplicons if st.session_state.get(f"amp_opt_{o}", False)
+            ]
+            _on_amplicons_change()  # clears doses
+
+    selected_amplicons = st.session_state["selected_amplicons"]
+    st.caption("Selected amplicons: " + (", ".join(selected_amplicons) if selected_amplicons else "none"))
 
     # ---------- DOSE(S) ----------
     if selected_plates:
         dose_pool = df[df["_Plate"].astype(str).isin(selected_plates)].copy()
         if amp_col and selected_amplicons:
             dose_pool = dose_pool[dose_pool[amp_col].astype(str).isin(selected_amplicons)]
-        available_doses = [
-            d for d in sorted(dose_pool["_Dose"].astype(str).unique()) if d != "NA"
-        ]
+        available_doses = [d for d in sorted(dose_pool["_Dose"].astype(str).unique()) if d != "NA"]
     else:
         available_doses = []
 
@@ -360,14 +373,23 @@ with st.sidebar:
             key="dose_clear",
             on_click=lambda: st.session_state.update(selected_doses=[]),
         )
-    selected_doses = st.multiselect(
-        "Dose(s)",
-        options=available_doses,
-        default=st.session_state["selected_doses"],
-        key="selected_doses",
-        label_visibility="collapsed",
-        help="Pick which doses to plot",
-    )
+
+    with st.expander("Choose dose(s)", expanded=False):
+        q_dose = st.text_input(
+            "Search doses", key="dose_search",
+            label_visibility="collapsed", placeholder="Search doses"
+        )
+        dose_opts = [o for o in available_doses if not q_dose or q_dose.lower() in o.lower()]
+        for o in dose_opts:
+            st.checkbox(o, key=f"dose_opt_{o}", value=(o in st.session_state.selected_doses))
+        if st.button("Apply doses", key="apply_doses"):
+            st.session_state.selected_doses = [
+                o for o in available_doses if st.session_state.get(f"dose_opt_{o}", False)
+            ]
+
+    selected_doses = st.session_state["selected_doses"]
+    st.caption("Selected doses: " + (", ".join(selected_doses) if selected_doses else "none"))
+
 
     st.header("3) Plot options")
     group_by_series = st.checkbox("Group by dose series (keep doses of same group together)", value=True)
@@ -434,20 +456,26 @@ dose_order = dose_low_to_high if dose_order_choice == "Low → High" else dose_h
 
 # X categories
 if group_by_series:
-    groups_input_order = pd.unique(fdf["_Group"].astype(str)).tolist()
-    if group_order_mode == "As input order":
+    groups_input_order = list(pd.unique(fdf["_Group"].astype(str)))
+
+    if group_order_mode == "As input order" or not dose_for_group_sort:
         groups_sorted = groups_input_order
-    elif group_order_mode in ("By selected dose mean ↓", "By selected dose mean ↑") and dose_for_group_sort:
-        by_group_dose = agg_indel[agg_indel["_Dose"].astype(str) == dose_for_group_sort].groupby("_Group")["mean"].mean()
-        all_groups = agg_indel["_Group"].astype(str).unique().tolist()
-        scores = {g: by_group_dose.get(g, np.nan) for g in all_groups}
-        desc = group_order_mode.endswith("↓")
-        def sort_key(g):
-            v = scores[g]
-            return (-np.inf if pd.isna(v) and not desc else (np.inf if pd.isna(v) and desc else v))
-        groups_sorted = sorted(all_groups, key=sort_key, reverse=desc)
     else:
-        groups_sorted = groups_input_order
+        # mean per group for the selected dose
+        means_sel = (
+            agg_indel[agg_indel["_Dose"].astype(str) == dose_for_group_sort]
+            .groupby("_Group")["mean"]
+            .mean()
+        )
+        desc = group_order_mode.endswith("↓")
+
+        # split into groups that HAVE this dose vs those that DON'T (preserve input order for missing)
+        groups_with = [g for g in groups_input_order if g in means_sel.index]
+        groups_without = [g for g in groups_input_order if g not in means_sel.index]
+
+        # sort only the ones that have the dose, then append the missing ones unchanged
+        groups_with_sorted = sorted(groups_with, key=lambda g: means_sel[g], reverse=desc)
+        groups_sorted = groups_with_sorted + groups_without
 
     x_categories = []
     for g in groups_sorted:
@@ -462,14 +490,17 @@ else:
 agg_indel["_DescLabel"] = pd.Categorical(agg_indel["_DescLabel"], categories=x_categories, ordered=True)
 
 # ---------------- Colors: darkest = highest dose ----------------
+# ---------------- Colors: mono-hue ramps (dark -> light) ----------------
 palette_cycle = [
-    px.colors.sequential.Reds,
     px.colors.sequential.Blues,
-    px.colors.sequential.Greens,
+    px.colors.sequential.Mint,
     px.colors.sequential.Oranges,
     px.colors.sequential.Purples,
+    px.colors.sequential.Greens,
+    px.colors.sequential.Reds,
     px.colors.sequential.Greys,
 ]
+
 def darkest_to_lightest(pal, n):
     half = pal[max(0, len(pal)//2):]
     seq = list(reversed(half))
