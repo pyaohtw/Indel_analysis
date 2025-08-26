@@ -1,8 +1,11 @@
-# streamlit_app.py  (v7.3)
-# - Filters: Select all/Clear with hierarchy clears (Plate > Amplicon > Dose)
-# - In vivo mode: parse Description like 'A1-...-0.2mpk' -> group='A-...', rep=1, dose='0.2mpk'
-# - Indel% main chart; optional %OOF chart (same order/colors)
-# - QC trimming; GraphPad tables incl. %OOF; Excel export; hi-res camera export
+# streamlit_app.py  (v8.0)
+# - NEW in vivo semantics:
+#   * Group letter + replicate parsed from leading token (A1, B2, …)
+#   * gRNA = text between the 1st and last '-' in Description
+#   * Dose = text after the last '-' (blank -> '0'); numeric extracted for ordering
+#   * Bars aggregated by (GroupLetter, gRNA, Dose); x label: "A-<gRNA>-<dose>"
+# - In vitro behavior, plotting, QC, and GraphPad tables remain as before
+# - In vivo adds a compact gRNA table: rows=gRNA, cols=<dose>-Indel / <dose>-OOF
 
 import io
 import re
@@ -18,16 +21,22 @@ st.caption(
     "Replicates are grouped by identical **Description** (or by animal pattern in **in vivo** mode). "
     "**Sample_ID** → Plate/Well (e.g., `py3B1` → plate `py3`, well `B1`). "
     "**In vitro**: **Description** ⇒ group = text before the last `-`, dose = token after the last `-` (blank → `0`). "
-    "**In vivo**: parse the **first** letter+number at the beginning (e.g., `A1-…-0.2mpk`) as Group=`A`, Replicate=`1`; "
-    "dose still comes from the last `-`. Rows not matching this pattern are removed from filters, plots, and exports."
+    "**In vivo**: Group = **first letter** at the beginning (e.g., `A1-…-0.2mpk` → `A`), "
+    "Replicate = digits after that letter (`1`), **gRNA** = the text **between the 1st and last '-'**, "
+    "dose from the last '-' (blank → `0`). Rows not matching this pattern are removed from in vivo analyses."
 )
 
 # ---------------- Sample dataset (for demo only) ----------------
 def load_sample() -> pd.DataFrame:
     return pd.DataFrame({
         "Sample_ID": ["py3A1","py3A2","py3A3","py3B1","py3B2","py3B3","py4A1","py4A2","py4A3","py4B1","py4B2","py4B3"],
-        "Description": ["A-120","A-120","A-120","A-60","A-60","A-60","B-120","B-120","B-120","B-30","B-30","B-30"],
-        "Amplicon_No": ["amp1","amp1","amp1","amp1","amp1","amp1","amp2","amp2","amp2","amp2","amp2","amp2"],
+        "Description": [
+            "A1-XXX-0.2", "A2-XXX-0.2", "A3-XXX-",   # dose blank -> 0
+            "B1-YYY-0.2", "B2-YYY-0.2", "B3-YYY-0.2",
+            "A1-XXX-0.4", "A2-XXX-0.4", "A3-XXX-0.4",
+            "B1-YYY-0.4", "B2-YYY-0.4", "B3-YYY-0.4"
+        ],
+        "Amplicon_No": ["amp1"]*12,
         "Indel%": [45.2, 47.1, 46.5, 10.1, 12.3, 9.8, 33.2, 32.5, 35.0, 55.0, 54.2, 53.5],
         "%OOF":   [ 5.1,  4.8,  5.3,  0.9,  1.2, 1.0,  3.2,  3.5,  3.1,  8.0,  7.6,  7.9],
         "Reads_in_input": [1.2e5, 1.1e5, 1.3e5, 9.0e4, 8.5e4, 8.8e4, 2.0e5, 2.1e5, 1.8e5, 6.0e4, 6.5e4, 6.2e4],
@@ -91,49 +100,69 @@ def parse_plate_well(sample_id: str):
 with st.sidebar:
     st.header("Study type")
     in_vivo_mode = st.checkbox(
-        "Analyze as **in vivo** data (names like `A1-…-0.2mpk`)",
+        "Analyze as **in vivo** data (names like `A1-<gRNA>-<dose>`; blank dose → 0)",
         value=False,
         help=(
-            "When on: parse the FIRST letter+number at the beginning (A1, B2, …) "
-            "as Group=letter and Replicate=number. Dose comes from the last '-' token "
-            "(blank doses become 0). Rows that don’t match this pattern are removed "
-            "from filters, plots, and exports."
+            "When on: Group = first letter at the very start (A/B/…), Replicate = digits after it; "
+            "gRNA = text between the 1st and last '-', dose = token after the last '-' (blank → 0). "
+            "Rows that don’t match a leading letter+number are dropped."
         ),
     )
 
-def parse_group_and_dose(description: str, in_vivo: bool):
+def parse_ivv(description: str):
     """
-    Returns: (group_label, dose_str, dose_val, rep_num, in_vivo_match)
-
-    In vitro: group = text before last '-'; dose = text after last '-' (or '0' if absent); rep_num = NaN
-    In vivo:  group = FIRST letter at start, replicate = digits immediately after it (e.g., A1, B2),
-              dose = text after last '-' (or '0' if absent). Rows not matching A<digits> at start are flagged False.
+    In vivo parser
+    Returns: (group_letter, rep_num, gRNA, dose_str, dose_val, matched)
+    - Leading token must start with letter+digits, e.g. 'A1' or 'C12'
+    - gRNA = between first '-' and last '-' (if only one '-', gRNA becomes empty)
+    - dose = after last '-' (blank -> '0')
     """
     if description is None or (isinstance(description, float) and np.isnan(description)):
-        return "Unknown", "0", 0.0, np.nan, False
+        return "NON-MATCH", np.nan, "", "0", 0.0, False
 
     s = str(description).strip()
 
-    # dose: last token after '-' (fallback to "0")
+    # leading letter+digits
+    m0 = re.match(r"^\s*([A-Za-z])(\d+)\b", s)
+    if not m0:
+        return "NON-MATCH", np.nan, "", "0", 0.0, False
+    grp_letter = m0.group(1)
+    rep_num = float(m0.group(2))
+
+    # split by '-'
+    parts = s.split("-")
+    if len(parts) == 1:
+        # no '-' -> no gRNA, no dose
+        dose_str = "0"
+        dose_val = 0.0
+        grna = ""
+    else:
+        first = parts[0]
+        last = parts[-1]
+        middle = "-".join(parts[1:-1]) if len(parts) > 2 else ""
+        grna = middle.strip()
+
+        dose_str = last.strip()
+        if dose_str == "":  # trailing '-' -> PBS/0
+            dose_str = "0"
+        dose_val = numeric_from_string(dose_str)
+
+    return grp_letter, rep_num, grna, dose_str, dose_val, True
+
+def parse_invitro(description: str):
+    """
+    In vitro fallback: group = text before last '-', dose = text after last '-' (blank -> '0')
+    """
+    if description is None or (isinstance(description, float) and np.isnan(description)):
+        return "Unknown", "0", 0.0
+    s = str(description).strip()
     if "-" in s:
         prefix, dose = s.rsplit("-", 1)
     else:
         prefix, dose = s, "0"
-    dose_val = numeric_from_string(dose)
-
-    if in_vivo:
-        # FIRST token: letter+number at the BEGINNING, e.g., A1, B2, Z10
-        m = re.match(r"^\s*([A-Za-z])(\d+)\b", s)
-        if m:
-            group_label = m.group(1)           # just the letter (A, B, C…)
-            rep_num = float(m.group(2))        # 1,2,3,...
-            return group_label, dose, dose_val, rep_num, True
-        else:
-            # mark as non-match; caller will drop these rows in in-vivo mode
-            return "NON-MATCH", dose, dose_val, np.nan, False
-
-    # default: in vitro rule (group = prefix before last '-')
-    return prefix, dose, dose_val, np.nan, True
+    if dose == "":
+        dose = "0"
+    return prefix, dose, numeric_from_string(dose)
 
 # ---------- Load raw ----------
 if uploaded:
@@ -158,7 +187,7 @@ with st.expander("Detected columns / change if needed", expanded=False):
     with c3:
         rin_col   = st.selectbox("Reads_in_input", options=[None] + list(raw.columns), index=(1 + raw.columns.get_loc(info["rin"]) if info["rin"] in raw.columns else 0))
         raa_col   = st.selectbox("Reads_aligned_all_amplicons", options=[None] + list(raw.columns), index=(1 + raw.columns.get_loc(info["raa"]) if info["raa"] in raw.columns else 0))
-    amp_col = st.selectbox("Amplicon column", options=[None] + list(raw.columns),
+    amp_col = st.selectbox("Amplicon column (optional)", options=[None] + list(raw.columns),
                            index=(1 + raw.columns.get_loc(info["amp"]) if info["amp"] in raw.columns else 0))
 
 # ---------- Clean numerics & parse fields ----------
@@ -170,23 +199,32 @@ if raa_col: df[raa_col] = df[raa_col].apply(numeric_from_string)
 
 plates, wells = zip(*df[sid_col].map(parse_plate_well))
 df["_Plate"] = list(plates); df["_Well"] = list(wells)
-group_label, dose, dose_val, repnum, match = zip(*df[desc_col].map(lambda s: parse_group_and_dose(s, in_vivo_mode)))
-df["_Group"]   = list(group_label)
-df["_Dose"]    = list(dose)
-df["_DoseVal"] = list(dose_val)
-df["_RepNum"]  = list(repnum)       # NaN for non-in-vivo or unmatched
-df["_InVivoMatch"] = list(match)
 
-# Normalize missing/blank doses → "0", and recompute numeric value
-df["_Dose"] = df["_Dose"].astype(str).replace({None: "0", "nan": "0", "NA": "0", "None": "0", "": "0"})
-df["_DoseVal"] = df["_Dose"].apply(numeric_from_string)
-
-# STRICT: when in-vivo is ON, DROP non-matching rows up front (shrinks Plates/Doses to only relevant)
 if in_vivo_mode:
+    gl, rn, grna, dstr, dval, ok = zip(*df[desc_col].map(parse_ivv))
+    df["_Group"] = list(gl)          # Group letter only
+    df["_RepNum"] = list(rn)
+    df["_gRNA"]   = list(grna)
+    df["_Dose"]   = list(dstr)
+    df["_DoseVal"]= list(dval)
+    df["_InVivoMatch"] = list(ok)
+    # Strict drop of non-matching rows
     df = df[df["_InVivoMatch"]].copy()
     if df.empty:
-        st.warning("In vivo mode is enabled, but none of the rows match the pattern like `A1-…-0.2mpk`. Turn off in vivo mode or check the data.")
+        st.warning("In vivo mode is enabled, but none of the rows match `A1-<gRNA>-<dose>`.")
         st.stop()
+else:
+    grp, dstr, dval = zip(*df[desc_col].map(parse_invitro))
+    df["_Group"] = list(grp)
+    df["_Dose"]  = list(dstr)
+    df["_DoseVal"]= list(dval)
+    df["_RepNum"] = np.nan
+    df["_gRNA"]   = ""  # not used in vitro
+    df["_InVivoMatch"] = True
+
+# Normalize missing/blank doses → "0", and recompute numeric
+df["_Dose"] = df["_Dose"].astype(str).replace({None: "0", "nan": "0", "NA": "0", "None": "0", "": "0"})
+df["_DoseVal"] = df["_Dose"].apply(numeric_from_string)
 
 # ---------- Compute alignment% and apply QC trimming ----------
 if rin_col and raa_col:
@@ -198,20 +236,14 @@ with st.sidebar:
     st.markdown("---")
 
 if apply_qc:
-    # Keep a copy BEFORE QC so we can report what's removed
     df_before_qc = df.copy()
-
     mask_qc = pd.Series(True, index=df.index)
     if rin_col:
         mask_qc &= df[rin_col].ge(qc_reads_min)
     if rin_col and raa_col:
         mask_qc &= df["alignment%"].ge(qc_align_min)
 
-    # Rows removed by QC (from the pre-QC df)
-    removed_mask = ~mask_qc
-    removed_df = df_before_qc.loc[removed_mask].copy()
-
-    # Pick columns to show (robust to missing)
+    removed_df = df_before_qc.loc[~mask_qc].copy()
     cols_show = []
     if sid_col: cols_show.append(sid_col)
     if desc_col: cols_show.append(desc_col)
@@ -219,8 +251,6 @@ if apply_qc:
     if raa_col: cols_show.append(raa_col)
     if "alignment%" in removed_df.columns: cols_show.append("alignment%")
     removed_df = removed_df[cols_show] if cols_show else removed_df
-
-    # Canonical pretty names
     rename_map = {}
     if sid_col: rename_map[sid_col] = "Sample_ID"
     if desc_col: rename_map[desc_col] = "Description"
@@ -228,24 +258,16 @@ if apply_qc:
     if raa_col: rename_map[raa_col] = "Reads_aligned_all_amplicons"
     removed_df = removed_df.rename(columns=rename_map)
 
-    # Apply QC filter
     df = df.loc[mask_qc].copy()
-
-    kept = len(df)
-    total_pre_qc = len(df_before_qc)
-    removed = total_pre_qc - kept
+    kept = len(df); total_pre_qc = len(df_before_qc); removed = total_pre_qc - kept
     st.success(f"QC trimming kept {kept}/{total_pre_qc} rows ({removed} removed).")
-
-    # Popout with removed Sample_IDs/details
     with st.expander(f"Show filtered-out samples ({removed})", expanded=False):
         if removed == 0:
             st.caption("No samples were removed by QC filters.")
         else:
-            # If Sample_ID exists, show it first
             ordered = ["Sample_ID", "Description", "Reads_in_input", "Reads_aligned_all_amplicons", "alignment%"]
             cols_present = [c for c in ordered if c in removed_df.columns]
             st.dataframe(removed_df[cols_present], use_container_width=True, hide_index=True)
-
 else:
     st.info("QC trimming is disabled. Enable it in the sidebar to filter by reads/alignment thresholds.")
 
@@ -283,52 +305,34 @@ st.markdown("---")
 
 # ---------------- Sidebar: Filters & options ----------------
 def _on_plates_change():
-    # user changed Plate(s) manually → reset downstream
     st.session_state.selected_amplicons = []
     st.session_state.selected_doses = []
 
 def _on_amplicons_change():
-    # user changed Amplicon(s) manually → reset downstream
     st.session_state.selected_doses = []
 
 with st.sidebar:
     st.header("2) Filters (to show)")
-
-    # keep state keys stable
     for k in ("selected_plates", "selected_amplicons", "selected_doses"):
         st.session_state.setdefault(k, [])
 
-    # ---------- PLATE(S) ----------
     available_plates = sorted(pd.Series(df["_Plate"].astype(str)).unique().tolist())
 
     st.write("**Plate(s)**")
     c1, c2 = st.columns(2)
     with c1:
-        st.button(
-            "Select all",
-            key="plates_all",
-            on_click=lambda: st.session_state.update(
-                selected_plates=available_plates,
-                selected_amplicons=[],
-                selected_doses=[],
-            ),
-        )
+        st.button("Select all", key="plates_all",
+                  on_click=lambda: st.session_state.update(
+                      selected_plates=available_plates,
+                      selected_amplicons=[], selected_doses=[]))
     with c2:
-        st.button(
-            "Clear",
-            key="plates_clear",
-            on_click=lambda: st.session_state.update(
-                selected_plates=[],
-                selected_amplicons=[],
-                selected_doses=[],
-            ),
-        )
+        st.button("Clear", key="plates_clear",
+                  on_click=lambda: st.session_state.update(
+                      selected_plates=[], selected_amplicons=[], selected_doses=[]))
 
     with st.expander("Choose plate(s)", expanded=False):
-        q_pl = st.text_input(
-            "Search plates", key="plate_search",
-            label_visibility="collapsed", placeholder="Search plates"
-        )
+        q_pl = st.text_input("Search plates", key="plate_search",
+                             label_visibility="collapsed", placeholder="Search plates")
         plate_opts = [o for o in available_plates if not q_pl or q_pl.lower() in o.lower()]
         for o in plate_opts:
             st.checkbox(o, key=f"plate_opt_{o}", value=(o in st.session_state.selected_plates))
@@ -336,13 +340,12 @@ with st.sidebar:
             st.session_state.selected_plates = [
                 o for o in available_plates if st.session_state.get(f"plate_opt_{o}", False)
             ]
-            _on_plates_change()  # clears downstream
+            _on_plates_change()
 
-    # current plate selection (read-only summary)
     selected_plates = st.session_state["selected_plates"]
     st.caption("Selected plates: " + (", ".join(selected_plates) if selected_plates else "none"))
 
-    # ---------- AMPLICON ----------
+# ---------- AMPLICON ----------
     if amp_col:
         amp_pool = (
             df[df["_Plate"].astype(str).isin(selected_plates)][amp_col].astype(str)
@@ -353,13 +356,16 @@ with st.sidebar:
         available_amplicons = []
 
     st.write("**Amplicon**")
+    amp_disabled = (not selected_plates)
+
     c1, c2 = st.columns(2)
     with c1:
         st.button(
             "Select all",
             key="amp_all",
+            disabled=amp_disabled,
             on_click=lambda: st.session_state.update(
-                selected_amplicons=available_amplicons,
+                selected_amplicons=available_amplicons if not amp_disabled else [],
                 selected_doses=[],
             ),
         )
@@ -367,6 +373,7 @@ with st.sidebar:
         st.button(
             "Clear",
             key="amp_clear",
+            disabled=amp_disabled,
             on_click=lambda: st.session_state.update(
                 selected_amplicons=[],
                 selected_doses=[],
@@ -374,23 +381,26 @@ with st.sidebar:
         )
 
     with st.expander("Choose amplicon(s)", expanded=False):
-        q_amp = st.text_input(
-            "Search amplicons", key="amp_search",
-            label_visibility="collapsed", placeholder="Search amplicons"
-        )
-        amp_opts = [o for o in available_amplicons if not q_amp or q_amp.lower() in o.lower()]
-        for o in amp_opts:
-            st.checkbox(o, key=f"amp_opt_{o}", value=(o in st.session_state.selected_amplicons))
-        if st.button("Apply amplicons", key="apply_amplicons"):
-            st.session_state.selected_amplicons = [
-                o for o in available_amplicons if st.session_state.get(f"amp_opt_{o}", False)
-            ]
-            _on_amplicons_change()  # clears doses
+        if amp_disabled:
+            st.caption("Select plate(s) first.")
+        else:
+            q_amp = st.text_input(
+                "Search amplicons", key="amp_search",
+                label_visibility="collapsed", placeholder="Search amplicons"
+            )
+            amp_opts = [o for o in available_amplicons if not q_amp or q_amp.lower() in o.lower()]
+            for o in amp_opts:
+                st.checkbox(o, key=f"amp_opt_{o}", value=(o in st.session_state.selected_amplicons))
+            if st.button("Apply amplicons", key="apply_amplicons", disabled=False):
+                st.session_state.selected_amplicons = [
+                    o for o in available_amplicons if st.session_state.get(f"amp_opt_{o}", False)
+                ]
+                _on_amplicons_change()  # clears doses
 
     selected_amplicons = st.session_state["selected_amplicons"]
     st.caption("Selected amplicons: " + (", ".join(selected_amplicons) if selected_amplicons else "none"))
 
-    # ---------- DOSE(S) ----------
+# ---------- DOSE(S) ----------
     if selected_plates:
         dose_pool = df[df["_Plate"].astype(str).isin(selected_plates)].copy()
         if amp_col and selected_amplicons:
@@ -400,59 +410,56 @@ with st.sidebar:
         available_doses = []
 
     st.write("**Dose(s)**")
+    dose_disabled = (not selected_plates)
+
     c1, c2 = st.columns(2)
     with c1:
         st.button(
             "Select all",
             key="dose_all",
-            on_click=lambda: st.session_state.update(selected_doses=available_doses),
+            disabled=dose_disabled,
+            on_click=lambda: st.session_state.update(
+                selected_doses=available_doses if not dose_disabled else []
+            ),
         )
     with c2:
         st.button(
             "Clear",
             key="dose_clear",
+            disabled=dose_disabled,
             on_click=lambda: st.session_state.update(selected_doses=[]),
         )
 
     with st.expander("Choose dose(s)", expanded=False):
-        q_dose = st.text_input(
-            "Search doses", key="dose_search",
-            label_visibility="collapsed", placeholder="Search doses"
-        )
-        dose_opts = [o for o in available_doses if not q_dose or q_dose.lower() in o.lower()]
-        for o in dose_opts:
-            st.checkbox(o, key=f"dose_opt_{o}", value=(o in st.session_state.selected_doses))
-        if st.button("Apply doses", key="apply_doses"):
-            st.session_state.selected_doses = [
-                o for o in available_doses if st.session_state.get(f"dose_opt_{o}", False)
-            ]
+        if dose_disabled:
+            st.caption("Select plate(s) first.")
+        else:
+            q_dose = st.text_input(
+                "Search doses", key="dose_search",
+                label_visibility="collapsed", placeholder="Search doses"
+            )
+            dose_opts = [o for o in available_doses if not q_dose or q_dose.lower() in o.lower()]
+            for o in dose_opts:
+                st.checkbox(o, key=f"dose_opt_{o}", value=(o in st.session_state.selected_doses))
+            if st.button("Apply doses", key="apply_doses", disabled=False):
+                st.session_state.selected_doses = [
+                    o for o in available_doses if st.session_state.get(f"dose_opt_{o}", False)
+                ]
 
     selected_doses = st.session_state["selected_doses"]
     st.caption("Selected doses: " + (", ".join(selected_doses) if selected_doses else "none"))
 
     st.header("3) Plot options")
-
-    # Always show OOF toggle
     show_oof = st.checkbox("Show %OOF chart", value=False, key="show_oof")
 
     if in_vivo_mode:
-        st.caption("In vivo mode: one bar per cohort = Group–Amplicon–Dose (replicates = animals).")
-
-        group_by_amplicon = st.checkbox(
-            "Group by amplicon (cluster by amplicon; input order within each)",
-            value=False,
-            disabled=(amp_col is None),
-        )
-
+        st.caption("In vivo mode: one bar per **(Group letter, gRNA, Dose)**; replicates = animals.")
         vivo_group_order = st.radio(
-            "Cohort order",
-            ["As input order", "By dose: High → Low", "By dose: Low → High"],
+            "Bar order", ["As input order", "By dose: High → Low", "By dose: Low → High"],
             index=0,
-            help="Sort cohorts by their dose. Cohorts with the same dose keep input order.",
+            help="Sort gRNA cohorts by dose; ties keep input order."
         )
-
     else:
-        # original in vitro controls
         group_by_series = st.checkbox("Group by dose series (keep doses of same group together)", value=True)
         dose_order_choice = st.radio("Dose order within group", options=["High → Low", "Low → High"], index=0)
         if group_by_series:
@@ -494,37 +501,20 @@ fdf = df[mask].copy()
 # Frame used for plotting/GraphPad
 fdf_plot = fdf.copy()
 
-def _amp_label(x):
-    s = str(x)
-    # make "1" -> "Amp1", leave "Amp2" as-is
-    return s if s.lower().startswith("amp") else (f"Amp{s}" if s.replace('.','',1).isdigit() else s)
-
-if in_vivo_mode:
-    if not amp_col:
-        st.warning("In vivo mode needs an amplicon column to form cohorts (Group–Amp–Dose).")
-        st.stop()
-    fdf_plot["_AmpLbl"] = fdf_plot[amp_col].astype(str).map(_amp_label)
-    fdf_plot["_Cohort"] = fdf_plot["_Group"].astype(str) + "-" + fdf_plot["_AmpLbl"].astype(str)
-else:
-    # keep a neutral label so downstream code works
-    fdf_plot["_AmpLbl"] = ""
-    fdf_plot["_Cohort"] = fdf_plot["_Group"].astype(str)
-
-# warn if in vivo mode but no rows match animal pattern
-if in_vivo_mode and not fdf["_RepNum"].notna().any():
-    st.warning("**In vivo mode is enabled, but none of the selected rows match the animal pattern** "
-               "(letter+number right before the last '-'). Showing standard grouping instead.")
-
 # ---------------- Aggregate for Indel% ----------------
-# ----- Aggregation for plotting -----
 if in_vivo_mode:
-    # one bar per (Cohort, Dose) = (Group–Amp, Dose); animals are replicates
+    # one bar per (GroupLetter, gRNA, Dose); animals are replicates
     agg_indel = (
-        fdf_plot.groupby(["_Cohort", "_Group", "_Dose", "_DoseVal"], dropna=False)[indel_col]
+        fdf_plot.groupby(["_Group", "_gRNA", "_Dose", "_DoseVal"], dropna=False)[indel_col]
                 .agg(mean="mean", std="std", count="count")
                 .reset_index()
     )
-    agg_indel["_DescLabel"] = agg_indel["_Cohort"].astype(str) + "-" + agg_indel["_Dose"].astype(str)
+    # x-axis label: A-<gRNA>-<dose>
+    agg_indel["_DescLabel"] = (
+        agg_indel["_Group"].astype(str) + "-" +
+        agg_indel["_gRNA"].astype(str) + "-" +
+        agg_indel["_Dose"].astype(str)
+    )
 else:
     agg_indel = (
         fdf_plot.groupby(["_Group", "_Dose", "_DoseVal"], dropna=False)[indel_col]
@@ -544,48 +534,22 @@ dose_high_to_low = list(reversed(dose_low_to_high))
 
 # ---------------- Build x-axis categories (ordering) ----------------
 if in_vivo_mode:
-    # Cohorts are Group–Amp; preserve input order by default
-    cohorts_input_order = list(pd.unique(fdf_plot["_Cohort"].astype(str)))
-
-    # dose per cohort (each should have one dose)
-    c2dose = agg_indel.groupby("_Cohort")["_DoseVal"].mean()
-
-    # read UI choices safely
-    group_by_amplicon = locals().get("group_by_amplicon", False)
-    vivo_group_order  = locals().get("vivo_group_order", "As input order")
-
-    if group_by_amplicon and amp_col:
-        # cluster cohorts by amplicon (first appearance order)
-        cohort2amp = (fdf_plot.drop_duplicates(["_Cohort"])
-                               .set_index("_Cohort")["_AmpLbl"].to_dict())
-        amp_order = []
-        for c in cohorts_input_order:
-            a = cohort2amp.get(c, "")
-            if a not in amp_order:
-                amp_order.append(a)
-        cohorts_sorted = []
-        for a in amp_order:
-            cohorts_sorted.extend([c for c in cohorts_input_order if cohort2amp.get(c, "") == a])
+    labels_input_order = list(pd.unique(
+        (fdf_plot["_Group"].astype(str) + "-" + fdf_plot["_gRNA"].astype(str) + "-" + fdf_plot["_Dose"].astype(str))
+    ))
+    # default: as input
+    if vivo_group_order == "By dose: High → Low":
+        # order by dose descending; ties keep input
+        dmap = agg_indel.set_index("_DescLabel")["_DoseVal"].to_dict()
+        labels_sorted = sorted(labels_input_order, key=lambda x: (dmap.get(x, -np.inf),), reverse=True)
+    elif vivo_group_order == "By dose: Low → High":
+        dmap = agg_indel.set_index("_DescLabel")["_DoseVal"].to_dict()
+        labels_sorted = sorted(labels_input_order, key=lambda x: (dmap.get(x, np.inf),))
     else:
-        # order by dose across cohorts; ties keep input order; cohorts without dose go last
-        hasdose = [c for c in cohorts_input_order if pd.notna(c2dose.get(c))]
-        nodose  = [c for c in cohorts_input_order if c not in hasdose]
-        if vivo_group_order == "By dose: High → Low":
-            cohorts_sorted = sorted(hasdose, key=lambda c: c2dose[c], reverse=True) + nodose
-        elif vivo_group_order == "By dose: Low → High":
-            cohorts_sorted = sorted(hasdose, key=lambda c: c2dose[c]) + nodose
-        else:
-            cohorts_sorted = cohorts_input_order
-
-    # one (cohort, dose) per bar
-    x_categories = []
-    for c in cohorts_sorted:
-        d_list = agg_indel.loc[agg_indel["_Cohort"] == c, "_Dose"].astype(str).tolist()
-        for d in d_list:
-            x_categories.append(f"{c}-{d}")
-
+        labels_sorted = labels_input_order
+    x_categories = [lbl for lbl in labels_sorted if lbl in set(agg_indel["_DescLabel"].astype(str))]
 else:
-    # in vitro path (original behavior, with missing-dose groups sent to the end)
+    # in vitro path (unchanged)
     group_by_series    = locals().get("group_by_series", True)
     dose_order_choice  = locals().get("dose_order_choice", "High → Low")
     group_order_mode   = locals().get("group_order_mode", "As input order")
@@ -619,19 +583,15 @@ else:
         )
         x_categories = list(dict.fromkeys(order_by_mean))
 
-# ----- Robust category assignment & fallback -----
+# ----- Category assignment & colors -----
 desc_vals = agg_indel["_DescLabel"].astype(str).tolist()
 present = set(desc_vals)
 if 'x_categories' not in locals() or not x_categories:
     x_categories = list(dict.fromkeys(desc_vals))
 else:
-    x_categories = [x for x in x_categories if x in present]
-    if not x_categories:
-        x_categories = list(dict.fromkeys(desc_vals))
-
+    x_categories = [x for x in x_categories if x in present] or list(dict.fromkeys(desc_vals))
 agg_indel["_DescLabel"] = pd.Categorical(agg_indel["_DescLabel"], categories=x_categories, ordered=True)
 
-# ---------------- Colors: ensure darkest = highest dose; cover all labels ----------------
 palette_cycle = [
     px.colors.sequential.Blues,
     px.colors.sequential.Mint,
@@ -651,7 +611,7 @@ def darkest_to_lightest(pal, n):
 
 color_discrete_map = {}
 if in_vivo_mode:
-    # shade by dose within each GROUP; keys are cohort-dose labels
+    # shade by dose within each GROUP letter
     for gi, g in enumerate(pd.unique(agg_indel["_Group"].astype(str))):
         pal = palette_cycle[gi % len(palette_cycle)]
         sub = agg_indel[agg_indel["_Group"] == g]
@@ -663,7 +623,7 @@ if in_vivo_mode:
         shades = darkest_to_lightest(pal, max(len(rank_order), 1))
         dose2shade = dict(zip(rank_order, shades))
         for _, row in sub.iterrows():
-            lbl = f"{row['_Cohort']}-{row['_Dose']}"
+            lbl = f"{row['_Group']}-{row['_gRNA']}-{row['_Dose']}"
             color_discrete_map[lbl] = dose2shade.get(str(row["_Dose"]), shades[0])
 else:
     for gi, (g, sub) in enumerate(agg_indel.groupby("_Group")):
@@ -677,14 +637,12 @@ else:
         for d, c in zip(rank_order, shades):
             color_discrete_map[f"{g}-{d}"] = c
 
-# Ensure every label has a color
 fallback = px.colors.qualitative.Plotly
 for lbl in pd.unique(agg_indel["_DescLabel"].astype(str)):
     if lbl not in color_discrete_map:
         color_discrete_map[lbl] = fallback[len(color_discrete_map) % len(fallback)]
 
 # ---------------- Plots ----------------
-# Safe defaults for image export if UI didn't run
 if "png_w" not in locals(): png_w = 1200
 if "lock_ratio" not in locals(): lock_ratio = True
 if "png_h" not in locals(): png_h = int(round(png_w * 9 / 16)) if lock_ratio else 675
@@ -712,17 +670,25 @@ else:
 
 # ---------------- Optional %OOF plot (same order/colors) ----------------
 if show_oof and oof_col and (oof_col in fdf_plot.columns):
-    agg_oof = (
-        (fdf_plot.groupby(["_Cohort", "_Group", "_Dose", "_DoseVal"], dropna=False)[oof_col].agg(mean="mean", std="std", count="count").reset_index())
-        if in_vivo_mode else
-        (fdf_plot.groupby(["_Group", "_Dose", "_DoseVal"], dropna=False)[oof_col].agg(mean="mean", std="std", count="count").reset_index())
-    )
-    agg_oof["_DescLabel"] = (
-        agg_oof["_Cohort"].astype(str) + "-" + agg_oof["_Dose"].astype(str)
-        if in_vivo_mode else
-        agg_oof["_Group"].astype(str) + "-" + agg_oof["_Dose"].astype(str)
-    )
-    # lock to same x order
+    if in_vivo_mode:
+        agg_oof = (
+            fdf_plot.groupby(["_Group", "_gRNA", "_Dose", "_DoseVal"], dropna=False)[oof_col]
+                    .agg(mean="mean", std="std", count="count")
+                    .reset_index()
+        )
+        agg_oof["_DescLabel"] = (
+            agg_oof["_Group"].astype(str) + "-" +
+            agg_oof["_gRNA"].astype(str) + "-" +
+            agg_oof["_Dose"].astype(str)
+        )
+    else:
+        agg_oof = (
+            fdf_plot.groupby(["_Group", "_Dose", "_DoseVal"], dropna=False)[oof_col]
+                    .agg(mean="mean", std="std", count="count")
+                    .reset_index()
+        )
+        agg_oof["_DescLabel"] = agg_oof["_Group"].astype(str) + "-" + agg_oof["_Dose"].astype(str)
+
     agg_oof["_DescLabel"] = pd.Categorical(agg_oof["_DescLabel"], categories=x_categories, ordered=True)
     if not agg_oof.empty:
         fig2 = px.bar(
@@ -742,51 +708,193 @@ if show_oof and oof_col and (oof_col in fdf_plot.columns):
         }
         st.plotly_chart(fig2, use_container_width=True, config=config2)
 
+# ---- small helper used by wide tables (both in vitro & in vivo) ----
+def fmt1(x):
+    try:
+        return f"{float(x):.1f}"
+    except Exception:
+        return "" if (x is None or (isinstance(x, float) and np.isnan(x))) else str(x)
+
 # ===================== Tables & Downloads =====================
 
-# Rows used (trimmed by QC + filters) — keep the raw filtered rows (fdf)
+# Rows used (trimmed by QC + filters)
 ordered_cols = ["Sample_ID", "Description", "Indel%", "%OOF",
                 "Reads_in_input", "Reads_aligned_all_amplicons", "alignment%"]
 col_map = {"Sample_ID": sid_col, "Description": desc_col, "Indel%": indel_col, "%OOF": oof_col,
            "Reads_in_input": rin_col, "Reads_aligned_all_amplicons": raa_col, "alignment%": "alignment%"}
 rows_df = pd.DataFrame({k: (np.nan if col_map[k] is None else fdf[col_map[k]]) for k in ordered_cols})
 
-# Build order for GraphPad tables from plotted categories
-# In vivo: x_categories contain 'Cohort-Dose' -> cohort is 'Group-Amp'
-groups_in_order = []
-for lbl in x_categories:
-    g = str(lbl).rsplit("-", 1)[0]  # strip trailing '-Dose'
-    if g not in groups_in_order:
-        groups_in_order.append(g)
+# ---------- GraphPad tables ----------
+# In vitro: keep previous wide tables
+# ---------- In vivo: gRNA table WITH replicates (Indel + %OOF, PBS rows last) ----------
+if in_vivo_mode:
+    # 1) Extract gRNA order from plotted x-axis
+    def _label_to_grna(lbl: str) -> str:
+        parts = str(lbl).split("-")
+        return "" if len(parts) < 3 else "-".join(parts[1:-1])
 
-# Dose columns in high->low order (to the right)
-doses_high_to_low = list(reversed(dose_low_to_high))
+    grna_order_plot = []
+    for lbl in x_categories:
+        g = _label_to_grna(lbl)
+        if g not in grna_order_plot:
+            grna_order_plot.append(g)
 
-def fmt1(x):
+    # 2) Original gRNA input order (for PBS tie-breaking)
+    grna_order_input = list(pd.unique(fdf_plot["_gRNA"].astype(str)))
+
+    # 3) Dose column order
+    if locals().get("vivo_group_order", "As input order") == "By dose: Low \u2192 High":
+        dose_columns_order = dose_low_to_high
+    else:
+        dose_columns_order = dose_high_to_low
+
+    # 4) Replicate sorting
+    def _rep_sort_key(sub):
+        if "_RepNum" in sub.columns and sub["_RepNum"].notna().any():
+            return sub.sort_values(by=["_RepNum", sid_col])
+        elif "_Well" in sub.columns and sub["_Well"].notna().any():
+            def _well_key(w):
+                s = str(w)
+                m = re.match(r"^([A-Ha-h])\s*[-:]?\s*(\d{1,2})$", s)
+                if m:
+                    return (ord(m.group(1).upper()) - ord('A'), int(m.group(2)))
+                return (99, 99, s)
+            return sub.sort_values(by=["_Well", sid_col], key=lambda s: s.map(_well_key) if s.name == "_Well" else s)
+        else:
+            return sub.sort_values(by=[sid_col])
+
+    # 5) Max replicates
+    max_reps = 1
+    for g in pd.unique(fdf_plot["_gRNA"].astype(str)):
+        for d in pd.unique(fdf_plot["_Dose"].astype(str)):
+            n = len(fdf_plot[(fdf_plot["_gRNA"] == g) & (fdf_plot["_Dose"].astype(str) == d)])
+            if n > max_reps:
+                max_reps = n
+
+    # 6) Build replicate columns
+    cols = []
+    for d in dose_columns_order:
+        for i in range(1, max_reps + 1):
+            cols.append(f"{d}-Indel-rep{i}")
+    if oof_col and oof_col in fdf_plot.columns:
+        for d in dose_columns_order:
+            for i in range(1, max_reps + 1):
+                cols.append(f"{d}-OOF-rep{i}")
+
+    def _fmt_blank(x):
+        try:
+            return f"{float(x):.1f}"
+        except Exception:
+            return "" if (x is None or (isinstance(x, float) and np.isnan(x))) else str(x)
+
+    # 7) Build rows
+    nonpbs_rows, pbs_rows = [], []
+    for g in grna_order_plot:
+        doses_here = pd.unique(fdf_plot.loc[fdf_plot["_gRNA"] == g, "_Dose"].astype(str))
+        has_pbs = any(d in ["", "0", "0.0"] for d in doses_here)
+
+        if has_pbs:
+            # PBS row
+            row = {"gRNA": f"PBS-{g}"}
+            for d in dose_columns_order:
+                sub = fdf_plot[(fdf_plot["_gRNA"] == g) & (fdf_plot["_Dose"].astype(str) == str(d))]
+                if d in ["", "0", "0.0"]:
+                    sub = _rep_sort_key(sub)
+                    vals_indel = [_fmt_blank(v) for v in sub[indel_col].tolist()]
+                    for i in range(1, max_reps + 1):
+                        row[f"{d}-Indel-rep{i}"] = (vals_indel[i-1] if i-1 < len(vals_indel) else "")
+                    if oof_col and oof_col in fdf_plot.columns:
+                        vals_oof = [_fmt_blank(v) for v in sub[oof_col].tolist()]
+                        for i in range(1, max_reps + 1):
+                            row[f"{d}-OOF-rep{i}"] = (vals_oof[i-1] if i-1 < len(vals_oof) else "")
+                else:
+                    for i in range(1, max_reps + 1):
+                        row[f"{d}-Indel-rep{i}"] = ""
+                        if oof_col and oof_col in fdf_plot.columns:
+                            row[f"{d}-OOF-rep{i}"] = ""
+            pbs_rows.append((g, row))
+
+        # non-PBS row
+        row = {"gRNA": g}
+        for d in dose_columns_order:
+            if d in ["", "0", "0.0"]:
+                for i in range(1, max_reps + 1):
+                    row[f"{d}-Indel-rep{i}"] = ""
+                    if oof_col and oof_col in fdf_plot.columns:
+                        row[f"{d}-OOF-rep{i}"] = ""
+                continue
+            sub = fdf_plot[(fdf_plot["_gRNA"] == g) & (fdf_plot["_Dose"].astype(str) == str(d))]
+            sub = _rep_sort_key(sub)
+            vals_indel = [_fmt_blank(v) for v in sub[indel_col].tolist()]
+            for i in range(1, max_reps + 1):
+                row[f"{d}-Indel-rep{i}"] = (vals_indel[i-1] if i-1 < len(vals_indel) else "")
+            if oof_col and oof_col in fdf_plot.columns:
+                vals_oof = [_fmt_blank(v) for v in sub[oof_col].tolist()]
+                for i in range(1, max_reps + 1):
+                    row[f"{d}-OOF-rep{i}"] = (vals_oof[i-1] if i-1 < len(vals_oof) else "")
+        nonpbs_rows.append(row)
+
+    # 8) Sort PBS rows by input order
+    pbs_rows_sorted = []
+    for g in grna_order_input:
+        for g2, row in pbs_rows:
+            if g == g2:
+                pbs_rows_sorted.append(row)
+
+    # Final table = non-PBS first (plot order), then PBS (input order)
+    gp_table = pd.DataFrame(nonpbs_rows + pbs_rows_sorted, columns=["gRNA"] + cols)
+
+    # ---------- Download ----------
+    st.subheader("Download")
+    excel_engine = None
     try:
-        return f"{float(x):.1f}"
+        import openpyxl  # noqa: F401
+        excel_engine = "openpyxl"
     except Exception:
-        return str(x)
+        try:
+            import xlsxwriter  # noqa: F401
+            excel_engine = "xlsxwriter"
+        except Exception:
+            excel_engine = None
 
-# Replicate sort helper (by well if available)
-def well_sort_key(w):
-    s = str(w)
-    m = re.match(r"^([A-Ha-h])\s*[-:]?\s*(\d{1,2})$", s)
-    if m:
-        return (ord(m.group(1).upper()) - ord('A'), int(m.group(2)))
-    return (99, 99, s)
+    if excel_engine:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine=excel_engine) as writer:
+            gp_table.to_excel(writer, index=False, sheet_name="gRNA_by_dose_reps")
+            rows_df.to_excel(writer, index=False, sheet_name="rows_used")  # last
+        st.download_button(
+            "Download Excel (.xlsx) — rows + gRNA table (Indel + OOF, replicates)",
+            data=buf.getvalue(),
+            file_name="in_vivo_grna_table_reps.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        st.info("Install `openpyxl` or `xlsxwriter` to enable .xlsx downloads.")
 
-# --- Choose the grouping key for GraphPad tables ---
-# In vivo: group == cohort ('Group-Amp'); In vitro: group == '_Group'
-gp_key = "_Cohort" if in_vivo_mode else "_Group"
+    # ---------- Preview ----------
+    st.subheader("gRNA table (in vivo, replicates with Indel + OOF)")
+    st.dataframe(gp_table, use_container_width=True, hide_index=True)
 
-# Source for GraphPad tables / plots is the plotting frame
-src_df = fdf_plot.copy()
-
-# Sort replicates within (group, dose)
-if "_RepNum" in src_df.columns and src_df["_RepNum"].notna().any():
-    fdf_sorted = src_df.sort_values(by=[gp_key, "_Dose", "_RepNum", sid_col])
 else:
+    # ------ original GraphPad wide tables for in vitro ------
+    # Build order for GraphPad tables from plotted categories
+    groups_in_order = []
+    for lbl in x_categories:
+        g = str(lbl).rsplit("-", 1)[0]
+        if g not in groups_in_order:
+            groups_in_order.append(g)
+
+    doses_high_to_low = list(reversed(dose_low_to_high))
+
+    def well_sort_key(w):
+        s = str(w)
+        m = re.match(r"^([A-Ha-h])\s*[-:]?\s*(\d{1,2})$", s)
+        if m:
+            return (ord(m.group(1).upper()) - ord('A'), int(m.group(2)))
+        return (99, 99, s)
+
+    gp_key = "_Group"
+    src_df = fdf_plot.copy()
     if "_Well" in src_df.columns and src_df["_Well"].notna().any():
         fdf_sorted = src_df.sort_values(
             by=[gp_key, "_Dose", "_Well"],
@@ -794,118 +902,105 @@ else:
         )
     else:
         fdf_sorted = src_df.sort_values(by=[gp_key, "_Dose", sid_col])
+    fdf_sorted["_rep_idx"] = fdf_sorted.groupby([gp_key, "_Dose"]).cumcount() + 1
 
-fdf_sorted["_rep_idx"] = fdf_sorted.groupby([gp_key, "_Dose"]).cumcount() + 1
-
-# ---------- GraphPad Type 1 (rows = Group/Cohort, cols = Doses; uniform replicates) ----------
-def make_type1(metric_label: str, metric_src_col: str) -> pd.DataFrame:
-    max_reps_global = 1
-    for d in doses_high_to_low:
-        cnt = (fdf_sorted[fdf_sorted["_Dose"].astype(str) == d]
-               .groupby(gp_key)[metric_src_col].count())
-        if not cnt.empty:
-            max_reps_global = max(max_reps_global, int(cnt.max()))
-
-    cols = [f"{d}_{metric_label}_rep{i}"
-            for d in doses_high_to_low
-            for i in range(1, max_reps_global + 1)]
-
-    rows = []
-    for g in groups_in_order:
-        row = {"Description": g}
-        subg = fdf_sorted[fdf_sorted[gp_key] == g]
+    def make_type1(metric_label: str, metric_src_col: str) -> pd.DataFrame:
+        max_reps_global = 1
         for d in doses_high_to_low:
-            subgd = subg[subg["_Dose"].astype(str) == d]
-            vals = [fmt1(v) for v in subgd.sort_values(["_RepNum", "_rep_idx"])[metric_src_col].tolist()]
-            for i in range(1, max_reps_global + 1):
-                row[f"{d}_{metric_label}_rep{i}"] = (vals[i-1] if i-1 < len(vals) else np.nan)
-        rows.append(row)
-
-    return pd.DataFrame(rows, columns=["Description"] + cols)
-
-type1_indel = (make_type1("Indel%", indel_col)
-               if indel_col in fdf_sorted.columns else pd.DataFrame({"Description": groups_in_order}))
-
-type1_df = type1_indel
-if oof_col and oof_col in fdf_sorted.columns:
-    type1_oof = make_type1("%OOF", oof_col)
-    type1_df = type1_indel.merge(type1_oof.drop(columns=["Description"]),
-                                 left_index=True, right_index=True)
-
-# ---------- GraphPad Type 2 (rows = Dose, cols = Group/Cohort; uniform replicates) ----------
-def make_type2(metric_label: str, metric_src_col: str) -> pd.DataFrame:
-    max_reps_global = 1
-    for g in groups_in_order:
-        cnt = (fdf_sorted[fdf_sorted[gp_key] == g]
-               .groupby("_Dose")[metric_src_col].count())
-        if not cnt.empty:
-            max_reps_global = max(max_reps_global, int(cnt.max()))
-
-    cols = [f"{g}_{metric_label}_rep{i}"
-            for g in groups_in_order
-            for i in range(1, max_reps_global + 1)]
-
-    rows = []
-    for d in doses_high_to_low:
-        row = {"Dose": d}
-        subd = fdf_sorted[fdf_sorted["_Dose"].astype(str) == d]
+            cnt = (fdf_sorted[fdf_sorted["_Dose"].astype(str) == d]
+                   .groupby(gp_key)[metric_src_col].count())
+            if not cnt.empty:
+                max_reps_global = max(max_reps_global, int(cnt.max()))
+        cols = [f"{d}_{metric_label}_rep{i}"
+                for d in doses_high_to_low
+                for i in range(1, max_reps_global + 1)]
+        rows = []
         for g in groups_in_order:
-            subdg = subd[subd[gp_key] == g]
-            vals = [fmt1(v) for v in subdg.sort_values(["_RepNum", "_rep_idx"])[metric_src_col].tolist()]
-            for i in range(1, max_reps_global + 1):
-                row[f"{g}_{metric_label}_rep{i}"] = (vals[i-1] if i-1 < len(vals) else np.nan)
-        rows.append(row)
+            row = {"Description": g}
+            subg = fdf_sorted[fdf_sorted[gp_key] == g]
+            for d in doses_high_to_low:
+                subgd = subg[subg["_Dose"].astype(str) == d]
+                vals = [fmt1(v) for v in subgd.sort_values(["_rep_idx"])[metric_src_col].tolist()]
+                for i in range(1, max_reps_global + 1):
+                    row[f"{d}_{metric_label}_rep{i}"] = (vals[i-1] if i-1 < len(vals) else np.nan)
+            rows.append(row)
+        return pd.DataFrame(rows, columns=["Description"] + cols)
 
-    return pd.DataFrame(rows, columns=["Dose"] + cols)
+    def make_type2(metric_label: str, metric_src_col: str) -> pd.DataFrame:
+        max_reps_global = 1
+        for g in groups_in_order:
+            cnt = (fdf_sorted[fdf_sorted[gp_key] == g]
+                   .groupby("_Dose")[metric_src_col].count())
+            if not cnt.empty:
+                max_reps_global = max(max_reps_global, int(cnt.max()))
+        cols = [f"{g}_{metric_label}_rep{i}"
+                for g in groups_in_order
+                for i in range(1, max_reps_global + 1)]
+        rows = []
+        for d in doses_high_to_low:
+            row = {"Dose": d}
+            subd = fdf_sorted[fdf_sorted["_Dose"].astype(str) == d]
+            for g in groups_in_order:
+                subdg = subd[subd[gp_key] == g]
+                vals = [fmt1(v) for v in subdg.sort_values(["_rep_idx"])[metric_src_col].tolist()]
+                for i in range(1, max_reps_global + 1):
+                    row[f"{g}_{metric_label}_rep{i}"] = (vals[i-1] if i-1 < len(vals) else np.nan)
+            rows.append(row)
+        return pd.DataFrame(rows, columns=["Dose"] + cols)
 
-type2_indel = (make_type2("Indel%", indel_col)
-               if indel_col in fdf_sorted.columns else pd.DataFrame({"Dose": doses_high_to_low}))
+    type1_indel = (make_type1("Indel%", indel_col)
+                   if indel_col in fdf_sorted.columns else pd.DataFrame({"Description": groups_in_order}))
+    type1_df = type1_indel
+    if oof_col and oof_col in fdf_sorted.columns:
+        type1_oof = make_type1("%OOF", oof_col)
+        type1_df = type1_indel.merge(type1_oof.drop(columns=["Description"]),
+                                     left_index=True, right_index=True)
 
-type2_df = type2_indel
-if oof_col and oof_col in fdf_sorted.columns:
-    type2_oof = make_type2("%OOF", oof_col)
-    type2_df = type2_indel.merge(type2_oof.drop(columns=["Dose"]),
-                                 left_index=True, right_index=True)
+    type2_indel = (make_type2("Indel%", indel_col)
+                   if indel_col in fdf_sorted.columns else pd.DataFrame({"Dose": doses_high_to_low}))
+    type2_df = type2_indel
+    if oof_col and oof_col in fdf_sorted.columns:
+        type2_oof = make_type2("%OOF", oof_col)
+        type2_df = type2_indel.merge(type2_oof.drop(columns=["Dose"]),
+                                     left_index=True, right_index=True)
 
-# ---------- Download ----------
-st.subheader("Download")
-excel_engine = None
-try:
-    import openpyxl  # noqa: F401
-    excel_engine = "openpyxl"
-except Exception:
+    st.subheader("Download")
+    excel_engine = None
     try:
-        import xlsxwriter  # noqa: F401
-        excel_engine = "xlsxwriter"
+        import openpyxl  # noqa: F401
+        excel_engine = "openpyxl"
     except Exception:
-        excel_engine = None
+        try:
+            import xlsxwriter  # noqa: F401
+            excel_engine = "xlsxwriter"
+        except Exception:
+            excel_engine = None
 
-if excel_engine:
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine=excel_engine) as writer:
-        rows_df.to_excel(writer, index=False, sheet_name="rows_used")
-        type1_df.to_excel(writer, index=False, sheet_name="graphpad_type1_groups")
-        type2_df.to_excel(writer, index=False, sheet_name="graphpad_type2_doses")
-    st.download_button(
-        "Download Excel (.xlsx) — rows + both GraphPad tables",
-        data=buf.getvalue(),
-        file_name="plot_data_and_graphpad.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    if excel_engine:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine=excel_engine) as writer:
+            type1_df.to_excel(writer, index=False, sheet_name="graphpad_type1_groups")
+            type2_df.to_excel(writer, index=False, sheet_name="graphpad_type2_doses")
+            rows_df.to_excel(writer, index=False, sheet_name="rows_used")  # last
+        st.download_button(
+            "Download Excel (.xlsx) — rows + both GraphPad tables",
+            data=buf.getvalue(),
+            file_name="plot_data_and_graphpad.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        st.info("Install `openpyxl` or `xlsxwriter` to enable .xlsx downloads.")
+
+    st.subheader("GraphPad-friendly wide table (rounded to 1 decimal)")
+    which_gp = st.radio(
+        "Layout to preview",
+        options=["Type 1: rows=Group, cols=Dose", "Type 2: rows=Dose, cols=Group"],
+        index=0, horizontal=True,
     )
-else:
-    st.info("Install `openpyxl` or `xlsxwriter` to enable .xlsx downloads.")
-
-# ---------- Preview tables ----------
-st.subheader("GraphPad-friendly wide table (rounded to 1 decimal)")
-which_gp = st.radio(
-    "Layout to preview",
-    options=["Type 1: rows=Group/Cohort, cols=Dose", "Type 2: rows=Dose, cols=Group/Cohort"],
-    index=0, horizontal=True,
-)
-if which_gp.startswith("Type 1"):
-    st.dataframe(type1_df, use_container_width=True, hide_index=True)
-else:
-    st.dataframe(type2_df, use_container_width=True, hide_index=True)
+    if which_gp.startswith("Type 1"):
+        st.dataframe(type1_df, use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(type2_df, use_container_width=True, hide_index=True)
 
 # ---------- Rows used ----------
 st.subheader("Rows used for this plot (filtered)")
