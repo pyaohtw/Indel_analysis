@@ -75,15 +75,66 @@ def infer_columns(df: pd.DataFrame):
     return {"desc": desc_col, "sid": sid_col, "indel": indel_col, "oof": oof_col,
             "rin": rin_col, "raa": raa_col, "amp": amp_col}
 
-def numeric_from_string(s):
-    if pd.isna(s): return np.nan
-    m = re.search(r"(-?\d+(\.\d+)?)", str(s))
-    return float(m.group(1)) if m else np.nan
+def numeric_from_string(x):
+    """Parse numbers robustly from mixed strings.
+
+    Handles:
+      - scientific notation:  -4.298e-09, 1E6
+      - plain numbers:        12, 3.45, -0.7
+      - with units/text:      '0.2mpk', '45%', 'reads: 1,234'
+      - unicode minus:        '−3.5'
+      - thousand separators:  '1,234.56'
+    Returns float or NaN.
+    """
+    if pd.isna(x):
+        return np.nan
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        return float(x)
+
+    s = str(x).strip()
+    if not s:
+        return np.nan
+
+    # normalize minus and remove thousands separators
+    s = s.replace("−", "-").replace("–", "-").replace(",", "")
+
+    # fast path: try full-string numeric parse first
+    val = pd.to_numeric(s, errors="coerce")
+    if not pd.isna(val):
+        return float(val)
+
+    # fallback: extract first numeric token (with optional exponent)
+    m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
+    return float(m.group(0)) if m else np.nan
+
 
 def clean_metric_column(df, col):
+    """Safely coerce a metric column to float using numeric_from_string."""
     if col and col in df.columns:
-        df[col] = df[col].apply(numeric_from_string)
+        s = df[col]
+        if pd.api.types.is_numeric_dtype(s):
+            df[col] = pd.to_numeric(s, errors="coerce")
+        else:
+            df[col] = s.apply(numeric_from_string)
     return df
+
+# ---- helpers used by tables/plots ----
+def fmt1(x):
+    try:
+        v = float(x)
+        if v < 0 and abs(v) < 1e-12:  # kill tiny negatives so "-0.0" never appears
+            v = 0.0
+        s = f"{v:.1f}"
+        return "0.0" if s == "-0.0" else s
+    except Exception:
+        return "" if (x is None or (isinstance(x, float) and np.isnan(x))) else str(x)
+
+def clip_nonnegative_inplace(df, cols):
+    """Coerce to numeric and clip negatives to 0.0 for the given columns."""
+    for c in cols:
+        if c and c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+            df[c] = df[c].mask(df[c] < 0, 0.0)
 
 def parse_plate_well(sample_id: str):
     if sample_id is None or (isinstance(sample_id, float) and np.isnan(sample_id)):
@@ -500,6 +551,10 @@ fdf = df[mask].copy()
 
 # Frame used for plotting/GraphPad
 fdf_plot = fdf.copy()
+clip_nonnegative_inplace(
+    fdf_plot,
+    [indel_col, oof_col, rin_col, raa_col, "alignment%"]
+)
 
 # ---------------- Aggregate for Indel% ----------------
 if in_vivo_mode:
@@ -731,12 +786,6 @@ if show_oof and oof_col and (oof_col in fdf_plot.columns):
         }
         st.plotly_chart(fig2, use_container_width=True, config=config2)
 
-# ---- small helper used by wide tables (both in vitro & in vivo) ----
-def fmt1(x):
-    try:
-        return f"{float(x):.1f}"
-    except Exception:
-        return "" if (x is None or (isinstance(x, float) and np.isnan(x))) else str(x)
 
 # ===================== Tables & Downloads =====================
 
@@ -746,6 +795,10 @@ ordered_cols = ["Sample_ID", "Description", "Indel%", "%OOF",
 col_map = {"Sample_ID": sid_col, "Description": desc_col, "Indel%": indel_col, "%OOF": oof_col,
            "Reads_in_input": rin_col, "Reads_aligned_all_amplicons": raa_col, "alignment%": "alignment%"}
 rows_df = pd.DataFrame({k: (np.nan if col_map[k] is None else fdf[col_map[k]]) for k in ordered_cols})
+clip_nonnegative_inplace(
+    rows_df,
+    ["Indel%", "%OOF", "Reads_in_input", "Reads_aligned_all_amplicons", "alignment%"]
+)
 
 # ---------- GraphPad tables ----------
 # In vitro: keep previous wide tables
