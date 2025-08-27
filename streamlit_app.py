@@ -648,6 +648,7 @@ if "lock_ratio" not in locals(): lock_ratio = True
 if "png_h" not in locals(): png_h = int(round(png_w * 9 / 16)) if lock_ratio else 675
 if "png_scale" not in locals(): png_scale = 2
 
+# ---------------- Plot with bars + SD ----------------
 if agg_indel.empty:
     st.warning("No data to plot after QC/filters. Try selecting more plates, amplicons, or doses.")
 else:
@@ -657,9 +658,21 @@ else:
         color="_DescLabel", color_discrete_map=color_discrete_map,
         hover_data={"_Group": True, "_Dose": True, "_DoseVal": True, "mean":":.2f", "std":":.2f", "count":True},
     )
-    fig.update_layout(
+    fig.update_layout(        
         margin=dict(l=10, r=10, t=30, b=10),
-        xaxis_title=None, yaxis_title="Mean Indel% (± SD)", showlegend=False
+        xaxis_title=None,  # or a string if you want a title
+        yaxis_title="Mean Indel% (± SD)",
+        showlegend=False,
+        xaxis=dict(
+            tickfont=dict(color="black"),
+            title=dict(font=dict(color="black"))
+        ),
+        yaxis=dict(
+            tickfont=dict(color="black"),
+            title=dict(font=dict(color="black"))
+        ),
+        plot_bgcolor="white",
+        paper_bgcolor="white"
     )
     config = {
         "toImageButtonOptions": {"format": "png", "filename": "indel_bars",
@@ -699,7 +712,17 @@ if show_oof and oof_col and (oof_col in fdf_plot.columns):
         )
         fig2.update_layout(
             margin=dict(l=10, r=10, t=30, b=10),
-            xaxis_title=None, yaxis_title="Mean %OOF (± SD)", showlegend=False
+            xaxis_title=None, yaxis_title="Mean %OOF (± SD)", showlegend=False,
+        xaxis=dict(
+            tickfont=dict(color="black"),
+            title=dict(font=dict(color="black"))
+        ),
+        yaxis=dict(
+            tickfont=dict(color="black"),
+            title=dict(font=dict(color="black"))
+        ),
+        plot_bgcolor="white",
+        paper_bgcolor="white"
         )
         config2 = {
             "toImageButtonOptions": {"format": "png", "filename": "oof_bars",
