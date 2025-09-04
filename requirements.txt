@@ -1,7 +1,7 @@
-streamlit>=1.36
-pandas>=2.0
-numpy>=1.24
-plotly>=5.20
-openpyxl>=3.1
-os
-# or: xlsxwriter>=3.2
+streamlit==1.49.1
+pandas==2.3.2
+numpy==2.3.2
+plotly==6.3.0
+openpyxl==3.1.5
+# optional but nice-to-have if you want the fallback engine too:
+# xlsxwriter==3.2.0
