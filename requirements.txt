@@ -3,4 +3,5 @@ pandas>=2.0
 numpy>=1.24
 plotly>=5.20
 openpyxl>=3.1
+os
 # or: xlsxwriter>=3.2

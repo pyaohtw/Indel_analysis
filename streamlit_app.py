@@ -9,6 +9,7 @@
 
 import io
 import re
+import os
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -225,6 +226,22 @@ else:
     st.stop()
 
 info = infer_columns(raw)
+
+# ---- Build Excel output name from input file name ----
+if uploaded is not None and getattr(uploaded, "name", None):
+    _input_name = uploaded.name
+elif use_sample:
+    _input_name = "example_dataset.csv"
+else:
+    _input_name = "input.csv"
+
+_file_stem = os.path.splitext(os.path.basename(_input_name))[0]
+# Requested style:
+excel_filename = f"{_file_stem}_For_GraphPad_Input.xlsx"
+
+# (Optional, clearer variants you can use instead)
+# excel_filename_in_vivo  = f"{_file_stem}_InVivo_gRNA_Reps_GraphPad.xlsx"
+# excel_filename_in_vitro = f"{_file_stem}_GraphPad_Tables.xlsx"
 
 # ---------- Column confirmation ----------
 with st.expander("Detected columns / change if needed", expanded=False):
@@ -941,7 +958,7 @@ if in_vivo_mode:
         st.download_button(
             "Download Excel (.xlsx) — rows + gRNA table (Indel + OOF, replicates)",
             data=buf.getvalue(),
-            file_name="in_vivo_grna_table_reps.xlsx",
+            file_name=excel_filename,  # <— here
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     else:
@@ -1061,7 +1078,7 @@ else:
         st.download_button(
             "Download Excel (.xlsx) — rows + both GraphPad tables",
             data=buf.getvalue(),
-            file_name="plot_data_and_graphpad.xlsx",
+            file_name=excel_filename,  # <— here
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     else:
