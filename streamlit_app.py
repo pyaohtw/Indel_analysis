@@ -24,7 +24,7 @@ st.caption(
     "**In vitro**: **Description** ⇒ group = text before the last `-`, dose = token after the last `-` (blank → `0`). "
     "**In vivo**: Group = **first letter** at the beginning (e.g., `A1-…-0.2mpk` → `A`), "
     "Replicate = digits after that letter (`1`), **gRNA** = the text **between the 1st and last '-'**, "
-    "dose from the last '-' (blank → `0`). Rows not matching this pattern are removed from in vivo analyses."
+    "dose from the last '-' (blank → `0`). In vivo Excel table rows are by **(Group, gRNA)** (PBS rows kept per group)."
 )
 
 # ---------------- Sample dataset (for demo only) ----------------
@@ -821,27 +821,37 @@ clip_nonnegative_inplace(
 # In vitro: keep previous wide tables
 # ---------- In vivo: gRNA table WITH replicates (Indel + %OOF, PBS rows last) ----------
 if in_vivo_mode:
-    # 1) Extract gRNA order from plotted x-axis
-    def _label_to_grna(lbl: str) -> str:
+    # 1) Extract (Group, gRNA) order from plotted x-axis (labels like "A-<gRNA>-<dose>")
+    def _label_to_group_grna(lbl: str):
         parts = str(lbl).split("-")
-        return "" if len(parts) < 3 else "-".join(parts[1:-1])
+        if len(parts) < 3:
+            return ("", "")
+        group = parts[0].strip()
+        grna  = "-".join(parts[1:-1]).strip()
+        return (group, grna)
 
-    grna_order_plot = []
+    pair_order_plot = []
     for lbl in x_categories:
-        g = _label_to_grna(lbl)
-        if g not in grna_order_plot:
-            grna_order_plot.append(g)
+        key = _label_to_group_grna(lbl)
+        if key not in pair_order_plot:
+            pair_order_plot.append(key)  # e.g., ("A", "XXX")
 
-    # 2) Original gRNA input order (for PBS tie-breaking)
-    grna_order_input = list(pd.unique(fdf_plot["_gRNA"].astype(str)))
+    # 2) Original input order for (Group, gRNA) (used to tie-break PBS order)
+    seen = set()
+    pair_order_input = []
+    for _, row in fdf_plot.iterrows():
+        key = (str(row["_Group"]), str(row["_gRNA"]))
+        if key not in seen:
+            seen.add(key)
+            pair_order_input.append(key)
 
-    # 3) Dose column order
+    # 3) Dose column order (same logic as before)
     if locals().get("vivo_group_order", "As input order") == "By dose: Low \u2192 High":
         dose_columns_order = dose_low_to_high
     else:
         dose_columns_order = dose_high_to_low
 
-    # 4) Replicate sorting
+    # 4) Replicate sorting (unchanged helper)
     def _rep_sort_key(sub):
         if "_RepNum" in sub.columns and sub["_RepNum"].notna().any():
             return sub.sort_values(by=["_RepNum", sid_col])
@@ -856,15 +866,14 @@ if in_vivo_mode:
         else:
             return sub.sort_values(by=[sid_col])
 
-    # 5) Max replicates
-    max_reps = 1
-    for g in pd.unique(fdf_plot["_gRNA"].astype(str)):
-        for d in pd.unique(fdf_plot["_Dose"].astype(str)):
-            n = len(fdf_plot[(fdf_plot["_gRNA"] == g) & (fdf_plot["_Dose"].astype(str) == d)])
-            if n > max_reps:
-                max_reps = n
+    # 5) Max replicates across (Group, gRNA, Dose)
+    max_reps = (
+        fdf_plot.groupby(["_Group", "_gRNA", "_Dose"]).size().max()
+        if not fdf_plot.empty else 1
+    )
+    max_reps = int(max_reps) if pd.notna(max_reps) else 1
 
-    # 6) Build replicate columns
+    # 6) Build replicate columns: one block per dose, then Indel/OOF by rep
     cols = []
     for d in dose_columns_order:
         for i in range(1, max_reps + 1):
@@ -880,61 +889,85 @@ if in_vivo_mode:
         except Exception:
             return "" if (x is None or (isinstance(x, float) and np.isnan(x))) else str(x)
 
-    # 7) Build rows
-    nonpbs_rows, pbs_rows = [], []
-    for g in grna_order_plot:
-        doses_here = pd.unique(fdf_plot.loc[fdf_plot["_gRNA"] == g, "_Dose"].astype(str))
-        has_pbs = any(d in ["", "0", "0.0"] for d in doses_here)
+    # Small helpers
+    def _is_pbs(d):
+        ds = str(d).strip().lower()
+        return (ds == "" or ds == "0" or ds == "0.0" or ds == "pbs")
 
+    # 7) Build rows keyed by (Group, gRNA)
+    nonpbs_rows, pbs_rows = [], []
+
+    for (G, g) in pair_order_plot:
+        doses_here = pd.unique(
+            fdf_plot[(fdf_plot["_Group"] == G) & (fdf_plot["_gRNA"] == g)]["_Dose"].astype(str)
+        )
+        has_pbs = any(_is_pbs(d) for d in doses_here)
+
+        # PBS row (per group)
         if has_pbs:
-            # PBS row
-            row = {"gRNA": f"PBS-{g}"}
+            row_pbs = {"gRNA": f"PBS-{G}-{g}"}
             for d in dose_columns_order:
-                sub = fdf_plot[(fdf_plot["_gRNA"] == g) & (fdf_plot["_Dose"].astype(str) == str(d))]
-                if d in ["", "0", "0.0"]:
+                sub = fdf_plot[(fdf_plot["_Group"] == G) &
+                            (fdf_plot["_gRNA"] == g) &
+                            (fdf_plot["_Dose"].astype(str) == str(d))]
+                if _is_pbs(d):
                     sub = _rep_sort_key(sub)
                     vals_indel = [_fmt_blank(v) for v in sub[indel_col].tolist()]
                     for i in range(1, max_reps + 1):
-                        row[f"{d}-Indel-rep{i}"] = (vals_indel[i-1] if i-1 < len(vals_indel) else "")
+                        row_pbs[f"{d}-Indel-rep{i}"] = (vals_indel[i-1] if i-1 < len(vals_indel) else "")
                     if oof_col and oof_col in fdf_plot.columns:
                         vals_oof = [_fmt_blank(v) for v in sub[oof_col].tolist()]
                         for i in range(1, max_reps + 1):
-                            row[f"{d}-OOF-rep{i}"] = (vals_oof[i-1] if i-1 < len(vals_oof) else "")
+                            row_pbs[f"{d}-OOF-rep{i}"] = (vals_oof[i-1] if i-1 < len(vals_oof) else "")
                 else:
+                    # empty cells for non-PBS doses on the PBS row
+                    for i in range(1, max_reps + 1):
+                        row_pbs[f"{d}-Indel-rep{i}"] = ""
+                        if oof_col and oof_col in fdf_plot.columns:
+                            row_pbs[f"{d}-OOF-rep{i}"] = ""
+            pbs_rows.append(((G, g), row_pbs))
+
+        # Non-PBS row (per group) — only if at least one non-PBS dose exists
+        has_nonpbs = any(
+            (not _is_pbs(d)) and
+            (not fdf_plot[(fdf_plot["_Group"] == G) &
+                        (fdf_plot["_gRNA"] == g) &
+                        (fdf_plot["_Dose"].astype(str) == str(d))].empty)
+            for d in dose_columns_order
+        )
+        if has_nonpbs:
+            row = {"gRNA": f"{G}-{g}"}
+            for d in dose_columns_order:
+                sub = fdf_plot[(fdf_plot["_Group"] == G) &
+                            (fdf_plot["_gRNA"] == g) &
+                            (fdf_plot["_Dose"].astype(str) == str(d))]
+                if _is_pbs(d):
+                    # leave blanks for PBS on the non-PBS row
                     for i in range(1, max_reps + 1):
                         row[f"{d}-Indel-rep{i}"] = ""
                         if oof_col and oof_col in fdf_plot.columns:
                             row[f"{d}-OOF-rep{i}"] = ""
-            pbs_rows.append((g, row))
+                    continue
 
-        # non-PBS row
-        row = {"gRNA": g}
-        for d in dose_columns_order:
-            if d in ["", "0", "0.0"]:
+                sub = _rep_sort_key(sub)
+                vals_indel = [_fmt_blank(v) for v in sub[indel_col].tolist()]
                 for i in range(1, max_reps + 1):
-                    row[f"{d}-Indel-rep{i}"] = ""
-                    if oof_col and oof_col in fdf_plot.columns:
-                        row[f"{d}-OOF-rep{i}"] = ""
-                continue
-            sub = fdf_plot[(fdf_plot["_gRNA"] == g) & (fdf_plot["_Dose"].astype(str) == str(d))]
-            sub = _rep_sort_key(sub)
-            vals_indel = [_fmt_blank(v) for v in sub[indel_col].tolist()]
-            for i in range(1, max_reps + 1):
-                row[f"{d}-Indel-rep{i}"] = (vals_indel[i-1] if i-1 < len(vals_indel) else "")
-            if oof_col and oof_col in fdf_plot.columns:
-                vals_oof = [_fmt_blank(v) for v in sub[oof_col].tolist()]
-                for i in range(1, max_reps + 1):
-                    row[f"{d}-OOF-rep{i}"] = (vals_oof[i-1] if i-1 < len(vals_oof) else "")
-        nonpbs_rows.append(row)
+                    row[f"{d}-Indel-rep{i}"] = (vals_indel[i-1] if i-1 < len(vals_indel) else "")
+                if oof_col and oof_col in fdf_plot.columns:
+                    vals_oof = [_fmt_blank(v) for v in sub[oof_col].tolist()]
+                    for i in range(1, max_reps + 1):
+                        row[f"{d}-OOF-rep{i}"] = (vals_oof[i-1] if i-1 < len(vals_oof) else "")
+            nonpbs_rows.append(row)
+        # else: skip creating a blank non-PBS row entirely
 
-    # 8) Sort PBS rows by input order
+    # 8) Sort PBS rows by original input (Group, gRNA) order
     pbs_rows_sorted = []
-    for g in grna_order_input:
-        for g2, row in pbs_rows:
-            if g == g2:
+    for key in pair_order_input:
+        for (k2, row) in pbs_rows:
+            if key == k2:
                 pbs_rows_sorted.append(row)
 
-    # Final table = non-PBS first (plot order), then PBS (input order)
+    # Final table: non-PBS (plot order) then PBS (input order)
     gp_table = pd.DataFrame(nonpbs_rows + pbs_rows_sorted, columns=["gRNA"] + cols)
 
     # ---------- Download ----------
@@ -953,7 +986,7 @@ if in_vivo_mode:
     if excel_engine:
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine=excel_engine) as writer:
-            gp_table.to_excel(writer, index=False, sheet_name="gRNA_by_dose_reps")
+            gp_table.to_excel(writer, index=False, sheet_name="group_gRNA_by_dose_reps")
             rows_df.to_excel(writer, index=False, sheet_name="rows_used")  # last
         st.download_button(
             "Download Excel (.xlsx) — rows + gRNA table (Indel + OOF, replicates)",
