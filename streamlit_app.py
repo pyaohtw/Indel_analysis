@@ -148,6 +148,155 @@ def parse_plate_well(sample_id: str):
     well = well[0] + str(int(well[1:]))  # normalize B01->B1
     return plate, well
 
+# ---- Excel helpers: autofit + header styling for both engines ----
+def _is_oof_col(name: str) -> bool:
+    return "oof" in str(name).lower()  # catches OOF, %OOF, -OOF-, etc.
+
+def _guess_col_widths(df, min_w=6, max_w=28):
+    # width in "Excel characters"; cap to keep it tidy
+    widths = []
+    for c in df.columns:
+        header = str(c)
+        body_max = max((len(str(v)) for v in df[c].fillna("").tolist()), default=0)
+        w = max(len(header), body_max) + 2
+        widths.append(max(min_w, min(w, max_w)))
+    return widths
+
+def style_sheet_xlsxwriter(writer, sheet_name, df):
+    wb = writer.book
+    ws = writer.sheets[sheet_name]
+
+    # Header formats
+    hfmt_indel = wb.add_format({
+        "bold": True, "text_wrap": True, "align": "center", "valign": "vcenter",
+        "bg_color": "#F8D7DA", "border": 1
+    })
+    hfmt_oof = wb.add_format({
+        "bold": True, "text_wrap": True, "align": "center", "valign": "vcenter",
+        "bg_color": "#D9E8FF", "border": 1  # light blue for OOF headers
+    })
+
+    # Write wrapped headers with per-column color
+    for col, name in enumerate(df.columns):
+        txt = format_header_for_excel(name)  # uses your hyphen/underscore-aware formatter
+        ws.write(0, col, txt, hfmt_oof if _is_oof_col(name) else hfmt_indel)
+
+    # Narrower width cap for these sheets (Type1/Type1-mean/Type2/in vivo)
+    narrow_sheets = {"graphpad_type1_groups", "graphpad_type1_groups_mean",
+                     "graphpad_type2_doses", "group_gRNA_by_dose_reps"}
+    max_cap = 10 if sheet_name in narrow_sheets else 16
+    widths = _guess_col_widths(df, min_w=6, max_w=max_cap)
+    for col, w in enumerate(widths):
+        ws.set_column(col, col, w)
+
+    ws.freeze_panes(1, 1)
+    ws.autofilter(0, 0, len(df), len(df.columns) - 1)
+    ws.set_row(0, 48)  # header height
+
+def style_sheet_openpyxl(writer, sheet_name, df):
+    from openpyxl.utils import get_column_letter
+    from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+
+    ws = writer.sheets[sheet_name]
+    ws.freeze_panes = "A2"
+    last_col = get_column_letter(df.shape[1])
+    ws.auto_filter.ref = f"A1:{last_col}{df.shape[0] + 1}"
+
+    align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    bold = Font(bold=True)
+    border = Border(left=Side(style="thin"), right=Side(style="thin"),
+                    top=Side(style="thin"), bottom=Side(style="thin"))
+    fill_indel = PatternFill("solid", fgColor="F8D7DA")
+    fill_oof   = PatternFill("solid", fgColor="D9E8FF")  # light blue for OOF headers
+
+    # Header cells (wrapped + colored per column)
+    for j, name in enumerate(df.columns, start=1):
+        cell = ws.cell(row=1, column=j)
+        cell.value = format_header_for_excel(name)
+        cell.alignment = align
+        cell.font = bold
+        cell.border = border
+        cell.fill = fill_oof if _is_oof_col(name) else fill_indel
+
+    ws.row_dimensions[1].height = 48
+
+    # Narrower width cap for these sheets
+    narrow_sheets = {"graphpad_type1_groups", "graphpad_type1_groups_mean",
+                     "graphpad_type2_doses", "group_gRNA_by_dose_reps"}
+    max_cap = 10 if sheet_name in narrow_sheets else 16
+    widths = _guess_col_widths(df, min_w=6, max_w=max_cap)
+    for j, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(j)].width = w
+
+# -------- Excel helper to wrap header -------- #
+import re, textwrap
+
+def _soft_wrap_desc(s: str, width: int = 24) -> str:
+    """
+    Wrap long 'description' parts at '-' or '_' boundaries if possible,
+    otherwise fall back to a soft width wrap.
+    """
+    s = str(s)
+    # Prefer splitting on '-' first, then '_'
+    for delim in ["-", "_"]:
+        if delim in s and len(s) > width:
+            parts = s.split(delim)
+            lines, cur = [], ""
+            for p in parts:
+                add = (delim if cur else "") + p
+                if len(cur) + len(add) > width and cur:
+                    lines.append(cur)
+                    cur = p
+                else:
+                    cur += add
+            if cur:
+                lines.append(cur)
+            return "\n".join(lines)
+    # Fallback plain soft wrap
+    return "\n".join(textwrap.wrap(s, width=width)) if len(s) > width else s
+
+def format_header_for_excel(name: str, desc_width: int = 24) -> str:
+    """
+    Supports:
+      - in vivo:  '<dose>-Indel-repN' or '<dose>-OOF-repN'  →  '<dose>\\nindel|oof\\nrepN'
+      - in vitro: '..._Indel%_repN' / '..._%OOF_repN' / '..._Indel%_mean' → '<left>\\nindel%|%oof\\nrepN|mean'
+    """
+    s = str(name)
+
+    # A) in vivo: dose-metric-repN (e.g., '0.25-Indel-rep1')
+    m = re.match(r"^(?P<dose>.+?)-(Indel|OOF)-(?P<rep>rep\d+)$", s, flags=re.I)
+    if m:
+        left_wrapped = _soft_wrap_desc(m.group("dose"), width=desc_width)
+        metric = m.group(2)
+        return f"{left_wrapped}\n{metric}\n{m.group('rep')}"
+
+    # B) in vitro / underscore pattern
+    parts = s.split("_")
+    if len(parts) >= 3 and re.fullmatch(r"(rep\d+|mean)", parts[-1] or "", flags=re.I):
+        metric = parts[-2]
+        rep_or_mean = parts[-1]
+        left = "_".join(parts[:-2])
+        left_wrapped = _soft_wrap_desc(left, width=desc_width)
+        return f"{left_wrapped}\n{metric}\n{rep_or_mean}"
+
+    # Fallback: soft wrap and break on separators
+    return _soft_wrap_desc(s, width=desc_width).replace("_", "\n").replace("-", "\n")
+
+def _guess_col_widths(df, min_w=6, max_w=28):
+    widths = []
+    for c in df.columns:
+        header = str(c)
+        body_max = max((len(str(v)) for v in df[c].fillna("").tolist()), default=0)
+        w = max(len(header), body_max) + 2
+        widths.append(max(min_w, min(w, max_w)))
+    return widths
+
+def style_sheet(writer, engine_name, sheet_name, df):
+    if engine_name == "xlsxwriter":
+        style_sheet_xlsxwriter(writer, sheet_name, df)
+    else:
+        style_sheet_openpyxl(writer, sheet_name, df)
+
 # -------- In vivo toggle (before parsing) --------
 with st.sidebar:
     st.header("Study type")
@@ -986,12 +1135,18 @@ if in_vivo_mode:
     if excel_engine:
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine=excel_engine) as writer:
+            # write sheets
             gp_table.to_excel(writer, index=False, sheet_name="group_gRNA_by_dose_reps")
-            rows_df.to_excel(writer, index=False, sheet_name="rows_used")  # last
+            rows_df.to_excel(writer, index=False, sheet_name="rows_used")
+
+            # style sheets
+            style_sheet(writer, excel_engine, "group_gRNA_by_dose_reps", gp_table)
+            style_sheet(writer, excel_engine, "rows_used", rows_df)
+
         st.download_button(
             "Download Excel (.xlsx) — rows + gRNA table (Indel + OOF, replicates)",
             data=buf.getvalue(),
-            file_name=excel_filename,  # <— here
+            file_name=excel_filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     else:
@@ -1074,6 +1229,24 @@ else:
             rows.append(row)
         return pd.DataFrame(rows, columns=["Dose"] + cols)
 
+    def make_type1_mean(metric_label: str, metric_src_col: str) -> pd.DataFrame:
+        """
+        Rows = Group, Cols = Dose (means over replicates), same order as Type 1 table.
+        """
+        cols = [f"{d}_{metric_label}_mean" for d in doses_high_to_low]
+        rows = []
+        for g in groups_in_order:
+            row = {"Description": g}
+            subg = fdf_sorted[fdf_sorted[gp_key] == g]
+            for d in doses_high_to_low:
+                subgd = subg[subg["_Dose"].astype(str) == d]
+                if subgd.empty or metric_src_col not in subgd.columns:
+                    row[f"{d}_{metric_label}_mean"] = np.nan
+                else:
+                    row[f"{d}_{metric_label}_mean"] = fmt1(subgd[metric_src_col].mean())
+            rows.append(row)
+        return pd.DataFrame(rows, columns=["Description"] + cols)
+
     type1_indel = (make_type1("Indel%", indel_col)
                    if indel_col in fdf_sorted.columns else pd.DataFrame({"Description": groups_in_order}))
     type1_df = type1_indel
@@ -1089,6 +1262,17 @@ else:
         type2_oof = make_type2("%OOF", oof_col)
         type2_df = type2_indel.merge(type2_oof.drop(columns=["Dose"]),
                                      left_index=True, right_index=True)
+
+# --- Type 1 MEAN (rows=Group, cols=Dose means) ---
+    type1_mean_indel = (make_type1_mean("Indel%", indel_col)
+                        if indel_col in fdf_sorted.columns else pd.DataFrame({"Description": groups_in_order}))
+    type1_mean_df = type1_mean_indel
+    if oof_col and oof_col in fdf_sorted.columns:
+        type1_mean_oof = make_type1_mean("%OOF", oof_col)
+        type1_mean_df = type1_mean_indel.merge(
+            type1_mean_oof.drop(columns=["Description"]),
+            left_index=True, right_index=True
+        )
 
     st.subheader("Download")
     excel_engine = None
@@ -1107,11 +1291,19 @@ else:
         with pd.ExcelWriter(buf, engine=excel_engine) as writer:
             type1_df.to_excel(writer, index=False, sheet_name="graphpad_type1_groups")
             type2_df.to_excel(writer, index=False, sheet_name="graphpad_type2_doses")
-            rows_df.to_excel(writer, index=False, sheet_name="rows_used")  # last
+            type1_mean_df.to_excel(writer, index=False, sheet_name="graphpad_type1_groups_mean")
+            rows_df.to_excel(writer, index=False, sheet_name="rows_used")
+
+            # style each sheet
+            style_sheet(writer, excel_engine, "graphpad_type1_groups", type1_df)
+            style_sheet(writer, excel_engine, "graphpad_type2_doses", type2_df)
+            style_sheet(writer, excel_engine, "graphpad_type1_groups_mean", type1_mean_df)
+            style_sheet(writer, excel_engine, "rows_used", rows_df)
+
         st.download_button(
             "Download Excel (.xlsx) — rows + both GraphPad tables",
             data=buf.getvalue(),
-            file_name=excel_filename,  # <— here
+            file_name=excel_filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
     else:
@@ -1120,10 +1312,17 @@ else:
     st.subheader("GraphPad-friendly wide table (rounded to 1 decimal)")
     which_gp = st.radio(
         "Layout to preview",
-        options=["Type 1: rows=Group, cols=Dose", "Type 2: rows=Dose, cols=Group"],
+        options=[
+            "Type 1: rows=Group, cols=Dose",
+            "Type 2: rows=Dose, cols=Group",
+            "Type 1 (MEAN): rows=Group, cols=Dose means"  # <— NEW
+        ],
         index=0, horizontal=True,
     )
-    if which_gp.startswith("Type 1"):
+
+    if which_gp.startswith("Type 1 (MEAN)"):
+        st.dataframe(type1_mean_df, use_container_width=True, hide_index=True)
+    elif which_gp.startswith("Type 1"):
         st.dataframe(type1_df, use_container_width=True, hide_index=True)
     else:
         st.dataframe(type2_df, use_container_width=True, hide_index=True)
