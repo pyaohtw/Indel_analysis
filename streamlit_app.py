@@ -148,6 +148,16 @@ def parse_plate_well(sample_id: str):
     well = well[0] + str(int(well[1:]))  # normalize B01->B1
     return plate, well
 
+# ---- Helper to sort doses in dropdown menu ----
+def sort_doses_for_ui(dose_list):
+    # Try numeric sort (desc) if *all* entries parse to numbers; else alphabetical.
+    vals = [numeric_from_string(d) for d in dose_list]
+    if all(pd.notna(v) for v in vals):
+        return [d for d, _ in sorted(zip(dose_list, vals), key=lambda t: t[1], reverse=True)]
+    # alphabetical, case-insensitive, stable
+    return sorted(dose_list, key=lambda x: (str(x).lower(), str(x)))
+
+
 # ---- Excel helpers: autofit + header styling for both engines ----
 def _is_oof_col(name: str) -> bool:
     return "oof" in str(name).lower()  # catches OOF, %OOF, -OOF-, etc.
@@ -622,7 +632,8 @@ with st.sidebar:
         dose_pool = df[df["_Plate"].astype(str).isin(selected_plates)].copy()
         if amp_col and selected_amplicons:
             dose_pool = dose_pool[dose_pool[amp_col].astype(str).isin(selected_amplicons)]
-        available_doses = [d for d in sorted(dose_pool["_Dose"].astype(str).unique()) if d != "NA"]
+        raw_doses = [d for d in dose_pool["_Dose"].astype(str).unique().tolist() if d != "NA"]
+        available_doses = sort_doses_for_ui(raw_doses)
     else:
         available_doses = []
 
