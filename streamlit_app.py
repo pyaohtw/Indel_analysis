@@ -13,6 +13,7 @@ import os
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 st.set_page_config(page_title="CRISPR Indel/%OOF Explorer", layout="wide")
@@ -1341,3 +1342,112 @@ else:
 # ---------- Rows used ----------
 st.subheader("Rows used for this plot (filtered)")
 st.dataframe(rows_df, use_container_width=True, hide_index=True)
+
+# ---------- Indel% Plate Heatmaps (after "Rows used for this plot (filtered)") ----------
+st.subheader("Indel% heatmap by plate (96-well layout)")
+
+if indel_col not in fdf_plot.columns:
+    st.info("No Indel% column detected for heatmap.")
+else:
+    # Build once: row/col mapping for 96-well plate
+    row_labels = list("ABCDEFGH")
+    col_labels = [str(i) for i in range(1, 13)]
+    row_index = {r: i for i, r in enumerate(row_labels)}
+    col_index = {c: i for i, c in enumerate(col_labels)}
+
+    def _well_to_rc(w):
+        s = str(w)
+        m = re.match(r"^\s*([A-Ha-h])\s*[-:]?\s*(\d{1,2})\s*$", s)
+        if not m:
+            return None
+        r = m.group(1).upper()
+        c = str(int(m.group(2)))  # normalize 01 -> 1
+        return (row_index[r], col_index[c]) if (r in row_index and c in col_index) else None
+
+    # Start from the filtered frame used elsewhere
+    df_heat = fdf_plot[["_Plate", "_Well", indel_col]].copy()
+    df_heat["_Plate"] = df_heat["_Plate"].astype(str).str.strip()
+    df_heat["_rc"] = df_heat["_Well"].map(_well_to_rc)
+    df_heat = df_heat[df_heat["_rc"].notna()].copy()
+
+    if df_heat.empty:
+        st.caption("No valid wells to plot after current filters.")
+    else:
+        plates_for_heat = sorted(df_heat["_Plate"].dropna().unique().tolist())
+
+        cols_per_row = 2
+        col_slots = st.columns(cols_per_row)
+
+        for i, plate in enumerate(plates_for_heat):
+            sub = df_heat[df_heat["_Plate"] == plate].copy()
+            if sub.empty:
+                continue
+
+            # If a well appears multiple times, keep the FIRST raw value (no averaging)
+            # Track duplicates to optionally notify
+            dup_mask = sub.duplicated("_rc", keep="first")
+            dup_count = int(dup_mask.sum())
+            if dup_count > 0:
+                st.warning(f"{plate}: {dup_count} duplicate well(s) detected; using the first occurrence.", icon="⚠️")
+
+            sub = sub.drop_duplicates("_rc", keep="first")
+
+            # Create matrices
+            Z = np.full((8, 12), np.nan, dtype=float)
+            text_matrix = np.empty((8, 12), dtype=object)
+            text_matrix[:] = ""
+
+            for _, r in sub.iterrows():
+                rr, cc = r["_rc"]
+                val = r[indel_col]
+                if pd.notna(val):
+                    v = round(float(val))          # round to integer (0 decimals)
+                    Z[rr, cc] = v
+                    text_matrix[rr, cc] = str(int(v))
+
+            # Build Plotly Heatmap (Viridis, thin colorbar)
+            fig_hm = go.Figure(data=go.Heatmap(
+                z=Z,
+                x=col_labels,
+                y=row_labels,
+                colorscale="Viridis",
+                zmin=0, zmax=100,
+                colorbar=dict(title="Indel%", thickness=10, outlinewidth=0),
+                text=text_matrix,
+                texttemplate="%{text}",
+                textfont=dict(color="black"),
+                hovertemplate="Row %{y}, Col %{x}<br>Indel%: %{z:.0f}<extra></extra>",
+            ))
+
+            # Axes styling: A at top; 1–12 on top; black ticks
+            fig_hm.update_yaxes(autorange="reversed", tickfont=dict(color="black"))
+            fig_hm.update_xaxes(
+                side="top",
+                tickmode="array",
+                tickvals=col_labels,
+                ticktext=col_labels,
+                tickfont=dict(color="black")
+            )
+
+            fig_hm.update_layout(
+                title=dict(
+                    text=str(plate),
+                    x=0.9, xanchor="center", y=0.95,
+                    font=dict(
+                        color="black",   # ← title text color
+                        size=20,         # ← title font size
+                        family="Arial"   # optional: font family
+                    )
+                ),
+                margin=dict(l=10, r=10, t=40, b=10),
+                xaxis_title=None, yaxis_title=None,
+                plot_bgcolor="white", paper_bgcolor="white",
+                width=None, height=360
+            )
+
+            with col_slots[i % cols_per_row]:
+                st.plotly_chart(fig_hm, use_container_width=True, config={"displaylogo": False})
+
+            # New row after every 2 plots
+            if (i % cols_per_row) == (cols_per_row - 1) and (i + 1) < len(plates_for_heat):
+                col_slots = st.columns(cols_per_row)
