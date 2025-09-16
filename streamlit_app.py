@@ -138,6 +138,16 @@ def clip_nonnegative_inplace(df, cols):
             df[c] = pd.to_numeric(df[c], errors="coerce")
             df[c] = df[c].mask(df[c] < 0, 0.0)
 
+def n1(x):
+    """Round to 1 decimal and return a float (NaN for blanks), never a string."""
+    try:
+        v = float(x)
+        if v < 0 and abs(v) < 1e-12:
+            v = 0.0
+        return round(v, 1)
+    except Exception:
+        return np.nan
+
 def parse_plate_well(sample_id: str):
     if sample_id is None or (isinstance(sample_id, float) and np.isnan(sample_id)):
         return "Unknown", "NA"
@@ -184,17 +194,20 @@ def style_sheet_xlsxwriter(writer, sheet_name, df):
     })
     hfmt_oof = wb.add_format({
         "bold": True, "text_wrap": True, "align": "center", "valign": "vcenter",
-        "bg_color": "#D9E8FF", "border": 1  # light blue for OOF headers
+        "bg_color": "#D9E8FF", "border": 1
     })
 
     # Write wrapped headers with per-column color
     for col, name in enumerate(df.columns):
-        txt = format_header_for_excel(name)  # uses your hyphen/underscore-aware formatter
+        txt = format_header_for_excel(name)
         ws.write(0, col, txt, hfmt_oof if _is_oof_col(name) else hfmt_indel)
 
-    # Narrower width cap for these sheets (Type1/Type1-mean/Type2/in vivo)
-    narrow_sheets = {"graphpad_type1_groups", "graphpad_type1_groups_mean",
-                     "graphpad_type2_doses", "group_gRNA_by_dose_reps"}
+    # Narrower width cap for these sheets
+    narrow_sheets = {
+        "type1_groups", "type1_groups_mean", "type2_doses",  # in vitro
+        "group_gRNA_by_dose_reps"                            # in vivo
+    }
+
     max_cap = 10 if sheet_name in narrow_sheets else 16
     widths = _guess_col_widths(df, min_w=6, max_w=max_cap)
     for col, w in enumerate(widths):
@@ -203,6 +216,7 @@ def style_sheet_xlsxwriter(writer, sheet_name, df):
     ws.freeze_panes(1, 1)
     ws.autofilter(0, 0, len(df), len(df.columns) - 1)
     ws.set_row(0, 48)  # header height
+
 
 def style_sheet_openpyxl(writer, sheet_name, df):
     from openpyxl.utils import get_column_letter
@@ -218,9 +232,9 @@ def style_sheet_openpyxl(writer, sheet_name, df):
     border = Border(left=Side(style="thin"), right=Side(style="thin"),
                     top=Side(style="thin"), bottom=Side(style="thin"))
     fill_indel = PatternFill("solid", fgColor="F8D7DA")
-    fill_oof   = PatternFill("solid", fgColor="D9E8FF")  # light blue for OOF headers
+    fill_oof   = PatternFill("solid", fgColor="D9E8FF")
 
-    # Header cells (wrapped + colored per column)
+    # Header cells
     for j, name in enumerate(df.columns, start=1):
         cell = ws.cell(row=1, column=j)
         cell.value = format_header_for_excel(name)
@@ -232,8 +246,10 @@ def style_sheet_openpyxl(writer, sheet_name, df):
     ws.row_dimensions[1].height = 48
 
     # Narrower width cap for these sheets
-    narrow_sheets = {"graphpad_type1_groups", "graphpad_type1_groups_mean",
-                     "graphpad_type2_doses", "group_gRNA_by_dose_reps"}
+    narrow_sheets = {
+        "type1_groups", "type1_groups_mean", "type2_doses",  # in vitro
+        "group_gRNA_by_dose_reps"                            # in vivo
+    }
     max_cap = 10 if sheet_name in narrow_sheets else 16
     widths = _guess_col_widths(df, min_w=6, max_w=max_cap)
     for j, w in enumerate(widths, start=1):
@@ -1044,11 +1060,15 @@ if in_vivo_mode:
             for i in range(1, max_reps + 1):
                 cols.append(f"{d}-OOF-rep{i}")
 
-    def _fmt_blank(x):
+    # Numeric rounder (local helper): returns float rounded to 1 decimal, or NaN
+    def _n1(x):
         try:
-            return f"{float(x):.1f}"
+            v = float(x)
+            if v < 0 and abs(v) < 1e-12:  # avoid -0.0
+                v = 0.0
+            return round(v, 1)
         except Exception:
-            return "" if (x is None or (isinstance(x, float) and np.isnan(x))) else str(x)
+            return np.nan
 
     # Small helpers
     def _is_pbs(d):
@@ -1069,55 +1089,55 @@ if in_vivo_mode:
             row_pbs = {"gRNA": f"PBS-{G}-{g}"}
             for d in dose_columns_order:
                 sub = fdf_plot[(fdf_plot["_Group"] == G) &
-                            (fdf_plot["_gRNA"] == g) &
-                            (fdf_plot["_Dose"].astype(str) == str(d))]
+                               (fdf_plot["_gRNA"] == g) &
+                               (fdf_plot["_Dose"].astype(str) == str(d))]
                 if _is_pbs(d):
                     sub = _rep_sort_key(sub)
-                    vals_indel = [_fmt_blank(v) for v in sub[indel_col].tolist()]
+                    vals_indel = [_n1(v) for v in sub[indel_col].tolist()]
                     for i in range(1, max_reps + 1):
-                        row_pbs[f"{d}-Indel-rep{i}"] = (vals_indel[i-1] if i-1 < len(vals_indel) else "")
+                        row_pbs[f"{d}-Indel-rep{i}"] = (vals_indel[i-1] if i-1 < len(vals_indel) else np.nan)
                     if oof_col and oof_col in fdf_plot.columns:
-                        vals_oof = [_fmt_blank(v) for v in sub[oof_col].tolist()]
+                        vals_oof = [_n1(v) for v in sub[oof_col].tolist()]
                         for i in range(1, max_reps + 1):
-                            row_pbs[f"{d}-OOF-rep{i}"] = (vals_oof[i-1] if i-1 < len(vals_oof) else "")
+                            row_pbs[f"{d}-OOF-rep{i}"] = (vals_oof[i-1] if i-1 < len(vals_oof) else np.nan)
                 else:
-                    # empty cells for non-PBS doses on the PBS row
+                    # NaN for non-PBS doses on the PBS row
                     for i in range(1, max_reps + 1):
-                        row_pbs[f"{d}-Indel-rep{i}"] = ""
+                        row_pbs[f"{d}-Indel-rep{i}"] = np.nan
                         if oof_col and oof_col in fdf_plot.columns:
-                            row_pbs[f"{d}-OOF-rep{i}"] = ""
+                            row_pbs[f"{d}-OOF-rep{i}"] = np.nan
             pbs_rows.append(((G, g), row_pbs))
 
         # Non-PBS row (per group) — only if at least one non-PBS dose exists
         has_nonpbs = any(
             (not _is_pbs(d)) and
             (not fdf_plot[(fdf_plot["_Group"] == G) &
-                        (fdf_plot["_gRNA"] == g) &
-                        (fdf_plot["_Dose"].astype(str) == str(d))].empty)
+                          (fdf_plot["_gRNA"] == g) &
+                          (fdf_plot["_Dose"].astype(str) == str(d))].empty)
             for d in dose_columns_order
         )
         if has_nonpbs:
             row = {"gRNA": f"{G}-{g}"}
             for d in dose_columns_order:
                 sub = fdf_plot[(fdf_plot["_Group"] == G) &
-                            (fdf_plot["_gRNA"] == g) &
-                            (fdf_plot["_Dose"].astype(str) == str(d))]
+                               (fdf_plot["_gRNA"] == g) &
+                               (fdf_plot["_Dose"].astype(str) == str(d))]
                 if _is_pbs(d):
-                    # leave blanks for PBS on the non-PBS row
+                    # NaN for PBS columns on the non-PBS row
                     for i in range(1, max_reps + 1):
-                        row[f"{d}-Indel-rep{i}"] = ""
+                        row[f"{d}-Indel-rep{i}"] = np.nan
                         if oof_col and oof_col in fdf_plot.columns:
-                            row[f"{d}-OOF-rep{i}"] = ""
+                            row[f"{d}-OOF-rep{i}"] = np.nan
                     continue
 
                 sub = _rep_sort_key(sub)
-                vals_indel = [_fmt_blank(v) for v in sub[indel_col].tolist()]
+                vals_indel = [_n1(v) for v in sub[indel_col].tolist()]
                 for i in range(1, max_reps + 1):
-                    row[f"{d}-Indel-rep{i}"] = (vals_indel[i-1] if i-1 < len(vals_indel) else "")
+                    row[f"{d}-Indel-rep{i}"] = (vals_indel[i-1] if i-1 < len(vals_indel) else np.nan)
                 if oof_col and oof_col in fdf_plot.columns:
-                    vals_oof = [_fmt_blank(v) for v in sub[oof_col].tolist()]
+                    vals_oof = [_n1(v) for v in sub[oof_col].tolist()]
                     for i in range(1, max_reps + 1):
-                        row[f"{d}-OOF-rep{i}"] = (vals_oof[i-1] if i-1 < len(vals_oof) else "")
+                        row[f"{d}-OOF-rep{i}"] = (vals_oof[i-1] if i-1 < len(vals_oof) else np.nan)
             nonpbs_rows.append(row)
         # else: skip creating a blank non-PBS row entirely
 
@@ -1130,6 +1150,12 @@ if in_vivo_mode:
 
     # Final table: non-PBS (plot order) then PBS (input order)
     gp_table = pd.DataFrame(nonpbs_rows + pbs_rows_sorted, columns=["gRNA"] + cols)
+
+    # Ensure all replicate columns are numeric floats in the output
+    _num_cols = [c for c in gp_table.columns
+                 if re.search(r"-(Indel|OOF)-rep\d+$", str(c), flags=re.I)]
+    for c in _num_cols:
+        gp_table[c] = pd.to_numeric(gp_table[c], errors="coerce")
 
     # ---------- Download ----------
     st.subheader("Download")
@@ -1169,8 +1195,7 @@ if in_vivo_mode:
     st.dataframe(gp_table, use_container_width=True, hide_index=True)
 
 else:
-    # ------ original GraphPad wide tables for in vitro ------
-    # Build order for GraphPad tables from plotted categories
+    # ------ in vitro wide tables (renamed sheets; no type1_groups_mean) ------
     groups_in_order = []
     for lbl in x_categories:
         g = str(lbl).rsplit("-", 1)[0]
@@ -1197,73 +1222,76 @@ else:
         fdf_sorted = src_df.sort_values(by=[gp_key, "_Dose", sid_col])
     fdf_sorted["_rep_idx"] = fdf_sorted.groupby([gp_key, "_Dose"]).cumcount() + 1
 
-    def make_type1(metric_label: str, metric_src_col: str) -> pd.DataFrame:
+    # ---------- Helpers ----------
+    def make_type1_groups_with_stats(metric_label: str, metric_src_col: str) -> pd.DataFrame:
+        """
+        Rows = Group; for each dose we add:
+          <dose>_<metric>_repN ... + <dose>_<metric>_mean + <dose>_<metric>_SD
+        """
         max_reps_global = 1
         for d in doses_high_to_low:
             cnt = (fdf_sorted[fdf_sorted["_Dose"].astype(str) == d]
                    .groupby(gp_key)[metric_src_col].count())
             if not cnt.empty:
                 max_reps_global = max(max_reps_global, int(cnt.max()))
-        cols = [f"{d}_{metric_label}_rep{i}"
-                for d in doses_high_to_low
-                for i in range(1, max_reps_global + 1)]
+
+        cols = []
+        for d in doses_high_to_low:
+            cols += [f"{d}_{metric_label}_rep{i}" for i in range(1, max_reps_global + 1)]
+            cols += [f"{d}_{metric_label}_mean", f"{d}_{metric_label}_SD"]
+
         rows = []
         for g in groups_in_order:
             row = {"Description": g}
             subg = fdf_sorted[fdf_sorted[gp_key] == g]
             for d in doses_high_to_low:
                 subgd = subg[subg["_Dose"].astype(str) == d]
-                vals = [fmt1(v) for v in subgd.sort_values(["_rep_idx"])[metric_src_col].tolist()]
+                vals = [n1(v) for v in subgd.sort_values(["_rep_idx"])[metric_src_col].tolist()]
                 for i in range(1, max_reps_global + 1):
                     row[f"{d}_{metric_label}_rep{i}"] = (vals[i-1] if i-1 < len(vals) else np.nan)
+                if subgd.empty or metric_src_col not in subgd.columns:
+                    row[f"{d}_{metric_label}_mean"] = np.nan
+                    row[f"{d}_{metric_label}_SD"]   = np.nan
+                else:
+                    vals_raw = subgd[metric_src_col].astype(float)
+                    row[f"{d}_{metric_label}_mean"] = n1(vals_raw.mean())
+                    row[f"{d}_{metric_label}_SD"]   = n1(vals_raw.std(ddof=1))
             rows.append(row)
         return pd.DataFrame(rows, columns=["Description"] + cols)
 
     def make_type2(metric_label: str, metric_src_col: str) -> pd.DataFrame:
+        """
+        Rows = Dose; Cols = Group replicates (floats, rounded 1dp).
+        """
         max_reps_global = 1
         for g in groups_in_order:
             cnt = (fdf_sorted[fdf_sorted[gp_key] == g]
                    .groupby("_Dose")[metric_src_col].count())
             if not cnt.empty:
                 max_reps_global = max(max_reps_global, int(cnt.max()))
+
         cols = [f"{g}_{metric_label}_rep{i}"
                 for g in groups_in_order
                 for i in range(1, max_reps_global + 1)]
+
         rows = []
         for d in doses_high_to_low:
             row = {"Dose": d}
             subd = fdf_sorted[fdf_sorted["_Dose"].astype(str) == d]
             for g in groups_in_order:
                 subdg = subd[subd[gp_key] == g]
-                vals = [fmt1(v) for v in subdg.sort_values(["_rep_idx"])[metric_src_col].tolist()]
+                vals = [n1(v) for v in subdg.sort_values(["_rep_idx"])[metric_src_col].tolist()]
                 for i in range(1, max_reps_global + 1):
                     row[f"{g}_{metric_label}_rep{i}"] = (vals[i-1] if i-1 < len(vals) else np.nan)
             rows.append(row)
         return pd.DataFrame(rows, columns=["Dose"] + cols)
 
-    def make_type1_mean(metric_label: str, metric_src_col: str) -> pd.DataFrame:
-        """
-        Rows = Group, Cols = Dose (means over replicates), same order as Type 1 table.
-        """
-        cols = [f"{d}_{metric_label}_mean" for d in doses_high_to_low]
-        rows = []
-        for g in groups_in_order:
-            row = {"Description": g}
-            subg = fdf_sorted[fdf_sorted[gp_key] == g]
-            for d in doses_high_to_low:
-                subgd = subg[subg["_Dose"].astype(str) == d]
-                if subgd.empty or metric_src_col not in subgd.columns:
-                    row[f"{d}_{metric_label}_mean"] = np.nan
-                else:
-                    row[f"{d}_{metric_label}_mean"] = fmt1(subgd[metric_src_col].mean())
-            rows.append(row)
-        return pd.DataFrame(rows, columns=["Description"] + cols)
-
-    type1_indel = (make_type1("Indel%", indel_col)
+    # ---- Build tables ----
+    type1_indel = (make_type1_groups_with_stats("Indel%", indel_col)
                    if indel_col in fdf_sorted.columns else pd.DataFrame({"Description": groups_in_order}))
     type1_df = type1_indel
     if oof_col and oof_col in fdf_sorted.columns:
-        type1_oof = make_type1("%OOF", oof_col)
+        type1_oof = make_type1_groups_with_stats("%OOF", oof_col)
         type1_df = type1_indel.merge(type1_oof.drop(columns=["Description"]),
                                      left_index=True, right_index=True)
 
@@ -1275,17 +1303,7 @@ else:
         type2_df = type2_indel.merge(type2_oof.drop(columns=["Dose"]),
                                      left_index=True, right_index=True)
 
-# --- Type 1 MEAN (rows=Group, cols=Dose means) ---
-    type1_mean_indel = (make_type1_mean("Indel%", indel_col)
-                        if indel_col in fdf_sorted.columns else pd.DataFrame({"Description": groups_in_order}))
-    type1_mean_df = type1_mean_indel
-    if oof_col and oof_col in fdf_sorted.columns:
-        type1_mean_oof = make_type1_mean("%OOF", oof_col)
-        type1_mean_df = type1_mean_indel.merge(
-            type1_mean_oof.drop(columns=["Description"]),
-            left_index=True, right_index=True
-        )
-
+    # ---- Excel download (type1 first, type2 second, rows_used last) ----
     st.subheader("Download")
     excel_engine = None
     try:
@@ -1301,19 +1319,61 @@ else:
     if excel_engine:
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine=excel_engine) as writer:
-            type1_df.to_excel(writer, index=False, sheet_name="graphpad_type1_groups")
-            type2_df.to_excel(writer, index=False, sheet_name="graphpad_type2_doses")
-            type1_mean_df.to_excel(writer, index=False, sheet_name="graphpad_type1_groups_mean")
-            rows_df.to_excel(writer, index=False, sheet_name="rows_used")
+            written = []
 
-            # style each sheet
-            style_sheet(writer, excel_engine, "graphpad_type1_groups", type1_df)
-            style_sheet(writer, excel_engine, "graphpad_type2_doses", type2_df)
-            style_sheet(writer, excel_engine, "graphpad_type1_groups_mean", type1_mean_df)
-            style_sheet(writer, excel_engine, "rows_used", rows_df)
+            # 1) type1_groups (first)
+            try:
+                if isinstance(type1_df, pd.DataFrame) and not type1_df.empty:
+                    type1_df.to_excel(writer, index=False, sheet_name="type1_groups")
+                    written.append(("type1_groups", type1_df))
+                else:
+                    st.info("type1_groups is empty; skipping that sheet.")
+            except Exception as e:
+                st.warning(f"type1_groups failed to export; skipping. Error: {e}")
+
+            # 2) type2_doses (second)
+            try:
+                if isinstance(type2_df, pd.DataFrame) and not type2_df.empty:
+                    type2_df.to_excel(writer, index=False, sheet_name="type2_doses")
+                    written.append(("type2_doses", type2_df))
+                else:
+                    st.info("type2_doses is empty; skipping that sheet.")
+            except Exception as e:
+                st.warning(f"type2_doses failed to export; skipping. Error: {e}")
+
+            # 3) rows_used (last; always write something so workbook is valid)
+            try:
+                rows_df_to_write = rows_df if isinstance(rows_df, pd.DataFrame) and not rows_df.empty \
+                                else pd.DataFrame({"note": ["no data"]})
+                rows_df_to_write.to_excel(writer, index=False, sheet_name="rows_used")
+                written.append(("rows_used", rows_df_to_write))
+            except Exception as e:
+                # last-resort fallback sheet
+                fallback = pd.DataFrame({"note": ["no data"]})
+                fallback.to_excel(writer, index=False, sheet_name="rows_used")
+                written.append(("rows_used", fallback))
+                st.warning(f"rows_used failed to export, wrote fallback. Error: {e}")
+
+            # Style only the sheets that exist
+            try:
+                for sheet_name, df_to_style in written:
+                    style_sheet(writer, excel_engine, sheet_name, df_to_style)
+            except Exception as e:
+                st.warning(f"Styling failed on one or more sheets: {e}")
+
+            # Ensure a visible active sheet
+            try:
+                wb = writer.book
+                if hasattr(wb, "worksheets") and wb.worksheets:
+                    wb.active = 0  # first created sheet (type1_groups if present)
+                    for ws in wb.worksheets:
+                        if getattr(ws, "sheet_state", "visible") != "visible":
+                            ws.sheet_state = "visible"
+            except Exception:
+                pass
 
         st.download_button(
-            "Download Excel (.xlsx) — rows + both GraphPad tables",
+            "Download Excel (.xlsx) — Type1/Type2 + rows_used",
             data=buf.getvalue(),
             file_name=excel_filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1321,20 +1381,17 @@ else:
     else:
         st.info("Install `openpyxl` or `xlsxwriter` to enable .xlsx downloads.")
 
-    st.subheader("GraphPad-friendly wide table (rounded to 1 decimal)")
+    # ---- On-screen preview (no mean sheet option) ----
+    st.subheader("In vitro wide tables (rounded to 1 decimal)")
     which_gp = st.radio(
         "Layout to preview",
         options=[
-            "Type 1: rows=Group, cols=Dose",
+            "Type 1: rows=Group, cols=Dose (reps+mean+SD)",
             "Type 2: rows=Dose, cols=Group",
-            "Type 1 (MEAN): rows=Group, cols=Dose means"  # <— NEW
         ],
         index=0, horizontal=True,
     )
-
-    if which_gp.startswith("Type 1 (MEAN)"):
-        st.dataframe(type1_mean_df, use_container_width=True, hide_index=True)
-    elif which_gp.startswith("Type 1"):
+    if which_gp.startswith("Type 1"):
         st.dataframe(type1_df, use_container_width=True, hide_index=True)
     else:
         st.dataframe(type2_df, use_container_width=True, hide_index=True)
