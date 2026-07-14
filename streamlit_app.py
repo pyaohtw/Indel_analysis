@@ -19,10 +19,13 @@ except Exception:
 st.set_page_config(page_title="CRISPR Indel / %OOF Explorer", layout="wide")
 st.title("CRISPR Indel / %OOF Explorer")
 st.caption(
-    "In vitro: group = text before the last '-', dose = token after the last '-' (blank → 0). "
+    "In vitro: group = text before the last '-' or '_' , dose = token after that separator (blank → 0). "
     "In vivo: only descriptions starting like A1-... or B2-... are treated as in vivo; "
     "group = leading letter, mouse = following digits, gRNA = text between the 1st and last '-', dose = last token (blank → 0)."
 )
+
+EXCEL_MAX_ROWS = 1048576
+EXCEL_MAX_COLS = 16384
 
 
 def load_sample() -> pd.DataFrame:
@@ -63,6 +66,8 @@ def infer_columns(df: pd.DataFrame):
     rin_col = next((c for c in cols if re.search(r"reads.*input|input.*reads", c, flags=re.I)), None)
     raa_col = next((c for c in cols if re.search(r"reads.*aligned.*amplicon|aligned.*amplicon", c, flags=re.I)), None)
     amp_col = amp_exact or next((c for c in cols if re.search(r"\bamplicon(_?no)?\b|\bamplicon\b", c, flags=re.I)), None)
+    grna_col = next((c for c in cols if re.search(r"^grna$|g[_ ]?rna", c, flags=re.I)), None)
+    pam_col = next((c for c in cols if re.search(r"^pam$", c, flags=re.I)), None)
     if indel_col is None:
         indel_col = next((c for c in cols if re.search(r"indel.*%|%.*indel|indel[_ ]?percent", c, flags=re.I)), None)
     if oof_col is None:
@@ -75,6 +80,8 @@ def infer_columns(df: pd.DataFrame):
         "rin": rin_col,
         "raa": raa_col,
         "amp": amp_col,
+        "grna": grna_col,
+        "pam": pam_col,
     }
 
 
@@ -281,8 +288,11 @@ def parse_invitro(description: str):
     if description is None or (isinstance(description, float) and np.isnan(description)):
         return "Unknown", "0", 0.0
     s = str(description).strip()
-    if "-" in s:
-        prefix, dose = s.rsplit("-", 1)
+    idx_dash = s.rfind("-")
+    idx_underscore = s.rfind("_")
+    idx = max(idx_dash, idx_underscore)
+    if idx != -1:
+        prefix, dose = s[:idx], s[idx + 1:]
     else:
         prefix, dose = s, "0"
     if dose == "":
@@ -413,9 +423,11 @@ with st.expander("Detected columns / change if needed", expanded=False):
     with c1:
         desc_col = st.selectbox("Description", options=raw.columns, index=(raw.columns.get_loc(info["desc"]) if info["desc"] in raw.columns else 0))
         sid_col = st.selectbox("Sample_ID", options=raw.columns, index=(raw.columns.get_loc(info["sid"]) if info["sid"] in raw.columns else 0))
+        grna_input_col = st.selectbox("gRNA column (optional)", options=[None] + list(raw.columns), index=(1 + raw.columns.get_loc(info["grna"]) if info["grna"] in raw.columns else 0))
     with c2:
         indel_col = st.selectbox("Indel% column", options=raw.columns, index=(raw.columns.get_loc(info["indel"]) if info["indel"] in raw.columns else 0))
         oof_col = st.selectbox("%OOF column", options=[None] + list(raw.columns), index=(1 + raw.columns.get_loc(info["oof"]) if info["oof"] in raw.columns else 0))
+        pam_input_col = st.selectbox("PAM column (optional)", options=[None] + list(raw.columns), index=(1 + raw.columns.get_loc(info["pam"]) if info["pam"] in raw.columns else 0))
     with c3:
         rin_col = st.selectbox("Reads_in_input", options=[None] + list(raw.columns), index=(1 + raw.columns.get_loc(info["rin"]) if info["rin"] in raw.columns else 0))
         raa_col = st.selectbox("Reads_aligned_all_amplicons", options=[None] + list(raw.columns), index=(1 + raw.columns.get_loc(info["raa"]) if info["raa"] in raw.columns else 0))
@@ -605,7 +617,6 @@ with st.sidebar:
     png_h = int(round(png_w * 9 / 16)) if lock_ratio else st.number_input("PNG height (px)", min_value=500, max_value=1500, value=675, step=25)
     png_scale = st.slider("Scale", 1, 3, 2)
 
-    st.header("Troubleshooting")
     with st.expander("Troubleshooting", expanded=False):
         safe_mode = st.checkbox(
             "Safe mode (disable Plotly charts and Excel export)",
@@ -802,7 +813,7 @@ if show_oof and oof_col and oof_col in fdf_plot.columns:
             config2 = {"toImageButtonOptions": {"format": "png", "filename": "oof_bars", "width": int(png_w), "height": int(png_h), "scale": int(png_scale)}, "displaylogo": False}
             st.plotly_chart(fig2, width="stretch", config=config2)
 
-ordered_cols = ["Sample_ID", "Description", "Indel%", "%OOF", "Reads_in_input", "Reads_aligned_all_amplicons", "alignment%"]
+ordered_cols = ["Sample_ID", "Description", "Indel%", "%OOF", "Reads_in_input", "Reads_aligned_all_amplicons", "alignment%", "gRNA", "PAM"]
 col_map = {
     "Sample_ID": sid_col,
     "Description": desc_col,
@@ -811,9 +822,13 @@ col_map = {
     "Reads_in_input": rin_col,
     "Reads_aligned_all_amplicons": raa_col,
     "alignment%": "alignment%",
+    "gRNA": grna_input_col,
+    "PAM": pam_input_col,
 }
 rows_df = pd.DataFrame({k: (np.nan if col_map[k] is None else fdf[col_map[k]]) for k in ordered_cols})
 clip_nonnegative_inplace(rows_df, ["Indel%", "%OOF", "Reads_in_input", "Reads_aligned_all_amplicons", "alignment%"])
+if "PAM" in rows_df.columns:
+    rows_df["PAM"] = rows_df["PAM"].where(rows_df["PAM"].notna(), "")
 
 if in_vivo_mode:
     def _label_to_group_grna(lbl: str):
@@ -1012,7 +1027,12 @@ else:
     type2_df = pd.concat(type2_parts, axis=1).reset_index()
     type1_slim_df = type1_full_df[[c for c in type1_full_df.columns if not (str(c).endswith("_mean") or str(c).endswith("_SD"))]].copy()
 
+    projected_type2_cols = int(type2_df.shape[1]) if isinstance(type2_df, pd.DataFrame) else 0
+    skip_type2_export = projected_type2_cols > EXCEL_MAX_COLS
+
     st.subheader("Download")
+    if skip_type2_export:
+        st.warning(f"⚠️ type2_doses was removed from the Excel export because it would exceed Excel's column limit ({projected_type2_cols:,} > {EXCEL_MAX_COLS:,}).")
     if safe_mode:
         st.info("Safe mode is on: Excel export is disabled.")
     else:
@@ -1025,7 +1045,7 @@ else:
             if not type1_full_df.empty:
                 type1_full_df.to_excel(writer, index=False, sheet_name="type1_groups_full")
                 style_sheet(writer, excel_engine, "type1_groups_full", type1_full_df)
-            if not type2_df.empty:
+            if (not skip_type2_export) and (not type2_df.empty):
                 type2_df.to_excel(writer, index=False, sheet_name="type2_doses")
                 style_sheet(writer, excel_engine, "type2_doses", type2_df)
             rows_df.to_excel(writer, index=False, sheet_name="rows_used")
@@ -1035,8 +1055,16 @@ else:
     render_indel_heatmap(fdf_plot, indel_col, safe_mode)
 
     st.subheader("In vitro tables (Preview)")
-    which_gp = st.radio("Layout", options=["Type 1 slim (Rows=Group)", "Type 1 full (Rows=Group)", "Type 2 (Rows=Dose)"], index=0, horizontal=True)
-    preview_df = type1_slim_df if which_gp.startswith("Type 1 slim") else type1_full_df if which_gp.startswith("Type 1 full") else type2_df
+    preview_options = ["Type 1 slim (Rows=Group)", "Type 1 full (Rows=Group)"]
+    if not skip_type2_export:
+        preview_options.append("Type 2 (Rows=Dose)")
+    which_gp = st.radio("Layout", options=preview_options, index=0, horizontal=True)
+    if which_gp.startswith("Type 1 slim"):
+        preview_df = type1_slim_df
+    elif which_gp.startswith("Type 1 full"):
+        preview_df = type1_full_df
+    else:
+        preview_df = type2_df
     st.code(preview_text(preview_df), language="text")
 
 st.subheader("Rows used")
